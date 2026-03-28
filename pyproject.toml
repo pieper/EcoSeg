@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecoseg"
+version = "0.1.0"
+description = "Ecological Segmentation - species-based interactive medical image segmentation"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "fastapi",
+    "uvicorn[standard]",
+    "highdicom",
+    "pydicom",
+    "scipy",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ecoseg*"]
