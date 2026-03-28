@@ -327,17 +327,20 @@ class LNQDataset:
         path = self._cache_path(study.study_id)
         if path is None:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            path,
-            volume=study.volume,
-            seg_mask=study.seg_mask if study.seg_mask is not None else np.array([]),
-            spacing=np.array(study.spacing),
-            meta=np.array([
-                study.study_id, study.patient_id,
-                study.annotation_type, study.ct_series_uid,
-            ]),
-        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                path,
+                volume=study.volume,
+                seg_mask=study.seg_mask if study.seg_mask is not None else np.array([]),
+                spacing=np.array(study.spacing),
+                meta=np.array([
+                    study.study_id, study.patient_id,
+                    study.annotation_type, study.ct_series_uid,
+                ]),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache {study.study_id}: {e}")
 
     def _load_from_cache(self, study_id: str) -> Optional[StudyData]:
         """Load a study from the local disk cache. Returns None on miss."""
