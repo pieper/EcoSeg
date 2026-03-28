@@ -161,17 +161,14 @@ def load_seg_mask(
 class LNQDataset:
     """Manager for the LNQ2023 dataset stored as local DICOM files.
 
-    Expected directory structure:
+    Expected directory structure (TCIA/IDC layout):
         data_root/
-            <PatientID>/
+            case_XXXX/
                 <StudyInstanceUID>/
-                    CT/
-                        *.dcm  (CT slices)
-                    SEG/
-                        *.dcm  (DICOM SEG)
-
-    Or a flat structure where each study directory is discovered
-    by scanning for DICOM files.
+                    CT_<SeriesInstanceUID>/
+                        <SOPInstanceUID>.dcm  (CT slices)
+                    SEG_<SeriesInstanceUID>/
+                        <SOPInstanceUID>.dcm  (DICOM SEG)
     """
 
     def __init__(self, data_root: Path):
@@ -182,8 +179,11 @@ class LNQDataset:
     def discover_studies(self) -> dict[str, dict]:
         """Scan the data directory and build an index of available studies.
 
+        Handles the TCIA/IDC layout where series directories are prefixed
+        with CT_ or SEG_ followed by their SeriesInstanceUID.
+
         Returns:
-            Dict mapping study_id to metadata (patient_id, annotation_type, paths)
+            Dict mapping patient_id (e.g. case_0002) to metadata and paths.
         """
         index = {}
         logger.info(f"Scanning {self.data_root} for DICOM studies...")
@@ -191,22 +191,36 @@ class LNQDataset:
         for patient_dir in sorted(self.data_root.iterdir()):
             if not patient_dir.is_dir():
                 continue
-            for study_dir in sorted(patient_dir.iterdir()):
-                if not study_dir.is_dir():
-                    continue
 
-                ct_dir = study_dir / "CT"
-                seg_dir = study_dir / "SEG"
+            # Find the study directory (there should be one per patient)
+            study_dirs = [d for d in patient_dir.iterdir() if d.is_dir()]
+            if not study_dirs:
+                continue
 
-                if ct_dir.exists() and seg_dir.exists():
-                    # Find the SEG file
+            for study_dir in study_dirs:
+                # Find CT and SEG series by prefix
+                ct_dir = None
+                seg_dir = None
+                for series_dir in sorted(study_dir.iterdir()):
+                    if not series_dir.is_dir():
+                        continue
+                    name = series_dir.name
+                    if name.startswith("CT"):
+                        ct_dir = series_dir
+                    elif name.startswith("SEG"):
+                        seg_dir = series_dir
+
+                if ct_dir is not None and seg_dir is not None:
+                    # SEG directory may contain one file (the SEG object)
                     seg_files = list(seg_dir.glob("*.dcm"))
                     if not seg_files:
                         seg_files = [f for f in seg_dir.iterdir() if f.is_file()]
 
-                    study_id = study_dir.name
+                    # Use patient_dir name (e.g. case_0002) as study_id
+                    study_id = patient_dir.name
                     index[study_id] = {
                         "patient_id": patient_dir.name,
+                        "study_uid": study_dir.name,
                         "ct_dir": ct_dir,
                         "seg_path": seg_files[0] if seg_files else None,
                     }
