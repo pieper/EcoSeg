@@ -93,12 +93,18 @@ def load_ct_volume(dicom_dir: Path) -> tuple[np.ndarray, tuple[float, float, flo
 def load_seg_mask(
     seg_path: Path,
     reference_shape: tuple[int, int, int],
+    ct_datasets: Optional[list[pydicom.Dataset]] = None,
 ) -> tuple[np.ndarray, str]:
     """Load a DICOM SEG object and extract the binary mask.
+
+    DICOM SEGs only contain frames for slices with annotations, so we
+    need to map each SEG frame back to the correct CT slice position
+    using the PerFrameFunctionalGroupsSequence.
 
     Args:
         seg_path: path to DICOM SEG file
         reference_shape: (D, H, W) shape of the CT volume to match
+        ct_datasets: sorted list of CT pydicom datasets (for z-position mapping)
 
     Returns:
         mask: (D, H, W) binary numpy array
@@ -115,45 +121,58 @@ def load_seg_mask(
     else:
         annotation_type = "unknown"
 
-    # Extract pixel data from SEG
-    # DICOM SEG can be binary or labelmap format
-    try:
-        import highdicom
-        seg = highdicom.seg.Segmentation.from_dataset(ds)
-        # Get the first segment (lymph node)
-        mask_frames = seg.get_pixels_by_dimension(
-            segment_numbers=[1],
-        )
-        # Reshape to volume
-        if mask_frames.ndim == 4:
-            mask = mask_frames.squeeze(-1)  # Remove segment dim
-        else:
-            mask = mask_frames
+    mask = np.zeros(reference_shape, dtype=np.uint8)
 
-        # Ensure correct shape
-        if mask.shape != reference_shape:
-            logger.warning(
-                f"SEG shape {mask.shape} != reference {reference_shape}, "
-                "attempting to match..."
-            )
-            # Pad or crop to match
-            result = np.zeros(reference_shape, dtype=np.uint8)
-            slices = tuple(
-                slice(0, min(m, r))
-                for m, r in zip(mask.shape, reference_shape)
-            )
-            result[slices] = mask[slices]
-            mask = result
+    # Build a z-position to slice index lookup from the CT datasets
+    z_to_slice = {}
+    if ct_datasets:
+        for i, ct_ds in enumerate(ct_datasets):
+            z_pos = round(float(ct_ds.ImagePositionPatient[2]), 3)
+            z_to_slice[z_pos] = i
 
-    except Exception as e:
-        logger.warning(f"highdicom loading failed ({e}), falling back to raw pixel data")
-        pixel_data = ds.pixel_array
-        if pixel_data.ndim == 3:
-            mask = (pixel_data > 0).astype(np.uint8)
-        elif pixel_data.ndim == 4:
-            mask = (pixel_data.max(axis=-1) > 0).astype(np.uint8)
-        else:
-            mask = (pixel_data > 0).astype(np.uint8).reshape(reference_shape)
+    # Extract frames from the SEG and map to CT slices
+    pixel_data = ds.pixel_array  # (num_frames, rows, cols) or with extra dim
+
+    if pixel_data.ndim == 4:
+        pixel_data = pixel_data.squeeze(-1)
+
+    num_frames = pixel_data.shape[0]
+    per_frame_groups = getattr(ds, "PerFrameFunctionalGroupsSequence", None)
+
+    if per_frame_groups and ct_datasets:
+        # Map each SEG frame to the correct CT slice using z-position
+        for frame_idx in range(num_frames):
+            frame_group = per_frame_groups[frame_idx]
+
+            # Get the z-position of this frame
+            plane_pos = getattr(frame_group, "PlanePositionSequence", None)
+            if plane_pos:
+                z_pos = round(float(plane_pos[0].ImagePositionPatient[2]), 3)
+                slice_idx = z_to_slice.get(z_pos)
+                if slice_idx is not None:
+                    frame_data = pixel_data[frame_idx]
+                    mask[slice_idx, :frame_data.shape[0], :frame_data.shape[1]] = (
+                        frame_data > 0
+                    ).astype(np.uint8)
+                else:
+                    # Try nearest z-position
+                    z_positions = np.array(list(z_to_slice.keys()))
+                    nearest_idx = np.argmin(np.abs(z_positions - z_pos))
+                    slice_idx = z_to_slice[z_positions[nearest_idx]]
+                    frame_data = pixel_data[frame_idx]
+                    mask[slice_idx, :frame_data.shape[0], :frame_data.shape[1]] = (
+                        frame_data > 0
+                    ).astype(np.uint8)
+    else:
+        # Fallback: if no per-frame groups or no CT datasets,
+        # assume frames are consecutive starting at slice 0
+        logger.warning("No per-frame position info; placing SEG frames sequentially")
+        n = min(num_frames, reference_shape[0])
+        for i in range(n):
+            frame_data = pixel_data[i]
+            mask[i, :frame_data.shape[0], :frame_data.shape[1]] = (
+                frame_data > 0
+            ).astype(np.uint8)
 
     return mask.astype(np.uint8), annotation_type
 
@@ -252,6 +271,7 @@ class LNQDataset:
             seg_mask, annotation_type = load_seg_mask(
                 info["seg_path"],
                 reference_shape=volume.shape,
+                ct_datasets=ct_datasets,
             )
 
         study = StudyData(
