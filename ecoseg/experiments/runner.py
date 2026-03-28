@@ -116,10 +116,14 @@ class ExperimentRunner:
         logger.info(f"Experiment '{config.name}' using device: {self.device}")
 
     def setup(self) -> None:
-        """Initialize dataset and species."""
+        """Initialize dataset, pre-load all studies, and create species."""
         # Load dataset
         self.dataset = LNQDataset(Path(self.config.data_root))
         self.dataset.discover_studies()
+
+        # Pre-load ALL studies in parallel using all available cores
+        all_ids = list(self.dataset._index.keys())
+        self.dataset.preload_studies(all_ids, num_workers=16)
 
         # Create species
         for name in self.config.species_names:
@@ -220,32 +224,48 @@ class ExperimentRunner:
     def evaluate(self, study_ids: list[str]) -> tuple[list[SegmentationScore], float]:
         """Run inference on studies and score against ground truth.
 
+        Inference runs on GPU sequentially (one scan at a time), but scoring
+        (Dice + ASSD) is submitted to a thread pool so the CPU computes
+        metrics while the GPU processes the next scan.
+
         Returns (scores, inference_time_s).
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         t0 = time.time()
-        scores = []
         ln_index = self.registry.species_names.index("lymph_node")
 
-        for sid in study_ids:
-            study = self.dataset.load_study(sid)
-            vol = normalize_ct(study.volume)
+        # Use threads for scoring (scipy releases GIL during distance_transform)
+        scoring_futures = []
 
-            labels, fitness_map = infer_volume(
-                self.registry, vol, self.config.inference
-            )
+        with ThreadPoolExecutor(max_workers=8) as scorer:
+            for i, sid in enumerate(study_ids):
+                study = self.dataset.load_study(sid)
+                vol = normalize_ct(study.volume)
 
-            # Prediction: voxels where lymph_node species won
-            prediction = (labels == ln_index).astype(np.uint8)
-
-            if study.seg_mask is not None:
-                ground_truth = (study.seg_mask > 0).astype(np.uint8)
-                score = score_segmentation(
-                    sid, prediction, ground_truth, study.spacing
+                labels, fitness_map = infer_volume(
+                    self.registry, vol, self.config.inference
                 )
+
+                prediction = (labels == ln_index).astype(np.uint8)
+
+                if study.seg_mask is not None:
+                    ground_truth = (study.seg_mask > 0).astype(np.uint8)
+                    # Submit scoring to thread pool — runs while GPU does next scan
+                    future = scorer.submit(
+                        score_segmentation,
+                        sid, prediction, ground_truth, study.spacing,
+                    )
+                    scoring_futures.append(future)
+
+                if (i + 1) % 10 == 0:
+                    logger.info(f"  Inferred {i + 1}/{len(study_ids)} scans")
+
+            # Collect all scores
+            scores = []
+            for future in scoring_futures:
+                score = future.result()
                 scores.append(score)
-                logger.debug(
-                    f"  {sid}: dice={score.dice:.3f}, assd={score.assd:.2f}mm"
-                )
 
         elapsed = time.time() - t0
         return scores, elapsed

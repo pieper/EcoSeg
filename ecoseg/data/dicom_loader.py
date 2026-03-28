@@ -177,6 +177,33 @@ def load_seg_mask(
     return mask.astype(np.uint8), annotation_type
 
 
+def _load_study_worker(info: dict, study_id: str) -> StudyData:
+    """Standalone function for loading a study in a worker process.
+
+    Must be a top-level function (not a method) for ProcessPoolExecutor.
+    """
+    volume, spacing, ct_datasets = load_ct_volume(info["ct_dir"])
+
+    seg_mask = None
+    annotation_type = "unknown"
+    if info["seg_path"] is not None:
+        seg_mask, annotation_type = load_seg_mask(
+            info["seg_path"],
+            reference_shape=volume.shape,
+            ct_datasets=ct_datasets,
+        )
+
+    return StudyData(
+        study_id=study_id,
+        patient_id=info["patient_id"],
+        volume=volume,
+        spacing=spacing,
+        seg_mask=seg_mask,
+        annotation_type=annotation_type,
+        ct_series_uid=str(getattr(ct_datasets[0], "SeriesInstanceUID", "")),
+    )
+
+
 class LNQDataset:
     """Manager for the LNQ2023 dataset stored as local DICOM files.
 
@@ -248,6 +275,31 @@ class LNQDataset:
         logger.info(f"Found {len(index)} studies")
         return index
 
+    def _load_single_study(self, study_id: str) -> StudyData:
+        """Load a single study from disk (no caching). Used by parallel loader."""
+        info = self._index[study_id]
+
+        volume, spacing, ct_datasets = load_ct_volume(info["ct_dir"])
+
+        seg_mask = None
+        annotation_type = "unknown"
+        if info["seg_path"] is not None:
+            seg_mask, annotation_type = load_seg_mask(
+                info["seg_path"],
+                reference_shape=volume.shape,
+                ct_datasets=ct_datasets,
+            )
+
+        return StudyData(
+            study_id=study_id,
+            patient_id=info["patient_id"],
+            volume=volume,
+            spacing=spacing,
+            seg_mask=seg_mask,
+            annotation_type=annotation_type,
+            ct_series_uid=str(getattr(ct_datasets[0], "SeriesInstanceUID", "")),
+        )
+
     def load_study(self, study_id: str) -> StudyData:
         """Load a single study's CT volume and segmentation."""
         if study_id in self._studies:
@@ -259,32 +311,59 @@ class LNQDataset:
         if study_id not in self._index:
             raise KeyError(f"Study {study_id} not found in dataset")
 
-        info = self._index[study_id]
-
-        # Load CT
-        volume, spacing, ct_datasets = load_ct_volume(info["ct_dir"])
-
-        # Load SEG if available
-        seg_mask = None
-        annotation_type = "unknown"
-        if info["seg_path"] is not None:
-            seg_mask, annotation_type = load_seg_mask(
-                info["seg_path"],
-                reference_shape=volume.shape,
-                ct_datasets=ct_datasets,
-            )
-
-        study = StudyData(
-            study_id=study_id,
-            patient_id=info["patient_id"],
-            volume=volume,
-            spacing=spacing,
-            seg_mask=seg_mask,
-            annotation_type=annotation_type,
-            ct_series_uid=str(getattr(ct_datasets[0], "SeriesInstanceUID", "")),
-        )
+        study = self._load_single_study(study_id)
         self._studies[study_id] = study
         return study
+
+    def preload_studies(self, study_ids: list[str], num_workers: int = 16) -> None:
+        """Pre-load multiple studies in parallel using a process pool.
+
+        All loaded studies are cached in memory for instant access during
+        training and evaluation. With 236GB RAM, the full LNQ dataset
+        (~513 CTs) fits comfortably.
+
+        Args:
+            study_ids: list of study IDs to pre-load
+            num_workers: number of parallel worker processes
+        """
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        if self._index is None:
+            self.discover_studies()
+
+        # Filter out already-loaded studies
+        to_load = [sid for sid in study_ids if sid not in self._studies]
+        if not to_load:
+            logger.info("All requested studies already in memory")
+            return
+
+        logger.info(f"Pre-loading {len(to_load)} studies using {num_workers} workers...")
+
+        # Use ProcessPoolExecutor for true parallelism (GIL-free)
+        # Each worker loads one study independently
+        loaded = 0
+        failed = 0
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all jobs
+            future_to_sid = {
+                executor.submit(_load_study_worker, self._index[sid], sid): sid
+                for sid in to_load
+            }
+
+            for future in as_completed(future_to_sid):
+                sid = future_to_sid[future]
+                try:
+                    study = future.result()
+                    self._studies[sid] = study
+                    loaded += 1
+                    if loaded % 20 == 0 or loaded == len(to_load):
+                        logger.info(f"  Pre-loaded {loaded}/{len(to_load)} studies")
+                except Exception as e:
+                    logger.warning(f"  Failed to load {sid}: {e}")
+                    failed += 1
+
+        logger.info(f"Pre-loading complete: {loaded} loaded, {failed} failed")
 
     def get_fully_annotated_ids(self) -> list[str]:
         """Return study IDs with full annotations."""
