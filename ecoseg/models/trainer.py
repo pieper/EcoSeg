@@ -56,16 +56,20 @@ def extract_patches(
     num_positive: int = 200,
     num_negative: int = 200,
     rng: Optional[np.random.Generator] = None,
+    hard_negatives: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract positive and negative patches from a labeled volume.
 
     Args:
-        volume: (D, H, W) CT volume, expected to be in HU or normalized
+        volume: (D, H, W) CT volume, expected to be normalized to [0, 1]
         mask: (D, H, W) binary mask, 1 = positive for this species
         patch_size: side length of cubic patches
         num_positive: number of positive patches to extract
         num_negative: number of negative patches to extract
         rng: random number generator for reproducibility
+        hard_negatives: if True, sample negatives from tissue regions with
+            similar intensity to the positive class, forcing the model to
+            learn shape/texture rather than just "tissue vs air"
 
     Returns:
         patches: (N, 1, ps, ps, ps) float tensor
@@ -82,7 +86,30 @@ def extract_patches(
     valid_mask[half:d - half, half:h - half, half:w - half] = True
 
     pos_coords = np.argwhere(valid_mask & (mask > 0))
-    neg_coords = np.argwhere(valid_mask & (mask == 0))
+
+    if hard_negatives and len(pos_coords) > 0:
+        # Sample negatives from tissue with similar intensity to positives.
+        # This prevents the model from learning "tissue vs air" and forces
+        # it to learn the actual distinguishing features of the target structure.
+        pos_values = volume[mask > 0]
+        intensity_low = np.percentile(pos_values, 10)
+        intensity_high = np.percentile(pos_values, 90)
+
+        # Tissue mask: voxels with similar intensity but NOT positive
+        tissue_mask = (
+            valid_mask
+            & (mask == 0)
+            & (volume >= intensity_low)
+            & (volume <= intensity_high)
+        )
+        hard_neg_coords = np.argwhere(tissue_mask)
+
+        if len(hard_neg_coords) > 0:
+            neg_coords = hard_neg_coords
+        else:
+            neg_coords = np.argwhere(valid_mask & (mask == 0))
+    else:
+        neg_coords = np.argwhere(valid_mask & (mask == 0))
 
     def sample_patches(coords: np.ndarray, count: int) -> list[np.ndarray]:
         if len(coords) == 0:
