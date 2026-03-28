@@ -12,6 +12,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
+from ecoseg import available_workers
 from ecoseg.models.species import SpeciesModel
 
 
@@ -24,7 +25,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     positive_patches_per_scan: int = 500
     negative_patches_per_scan: int = 500
-    num_workers: int = 16
+    num_workers: int = -1  # -1 means use available_workers()
     pin_memory: bool = True
 
 
@@ -283,7 +284,7 @@ def train_species(
             dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            num_workers=config.num_workers,
+            num_workers=config.num_workers if config.num_workers >= 0 else available_workers(),
             pin_memory=config.pin_memory and str(device) != "cpu",
         )
 

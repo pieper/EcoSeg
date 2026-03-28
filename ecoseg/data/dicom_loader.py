@@ -217,8 +217,9 @@ class LNQDataset:
                         <SOPInstanceUID>.dcm  (DICOM SEG)
     """
 
-    def __init__(self, data_root: Path):
+    def __init__(self, data_root: Path, cache_dir: Optional[Path] = None):
         self.data_root = Path(data_root)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self._studies: dict[str, StudyData] = {}
         self._index: Optional[dict] = None
 
@@ -315,16 +316,62 @@ class LNQDataset:
         self._studies[study_id] = study
         return study
 
-    def preload_studies(self, study_ids: list[str], num_workers: int = 16) -> None:
-        """Pre-load multiple studies in parallel using a process pool.
+    def _cache_path(self, study_id: str) -> Optional[Path]:
+        """Return the .npz cache file path for a study, or None if caching is disabled."""
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / f"{study_id}.npz"
 
-        All loaded studies are cached in memory for instant access during
-        training and evaluation. With 236GB RAM, the full LNQ dataset
-        (~513 CTs) fits comfortably.
+    def _save_to_cache(self, study: StudyData) -> None:
+        """Save a study to the local disk cache as .npz."""
+        path = self._cache_path(study.study_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            volume=study.volume,
+            seg_mask=study.seg_mask if study.seg_mask is not None else np.array([]),
+            spacing=np.array(study.spacing),
+            meta=np.array([
+                study.study_id, study.patient_id,
+                study.annotation_type, study.ct_series_uid,
+            ]),
+        )
+
+    def _load_from_cache(self, study_id: str) -> Optional[StudyData]:
+        """Load a study from the local disk cache. Returns None on miss."""
+        path = self._cache_path(study_id)
+        if path is None or not path.exists():
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            seg_mask = data["seg_mask"]
+            if seg_mask.ndim == 0 or seg_mask.size == 0:
+                seg_mask = None
+            meta = data["meta"]
+            return StudyData(
+                study_id=str(meta[0]),
+                patient_id=str(meta[1]),
+                volume=data["volume"],
+                spacing=tuple(data["spacing"].tolist()),
+                seg_mask=seg_mask,
+                annotation_type=str(meta[2]),
+                ct_series_uid=str(meta[3]),
+            )
+        except Exception as e:
+            logger.warning(f"Cache read failed for {study_id}: {e}")
+            return None
+
+    def preload_studies(self, study_ids: list[str], num_workers: int = -1) -> None:
+        """Pre-load multiple studies into memory.
+
+        Tries local disk cache first (fast). Falls back to loading from
+        DICOM source in parallel (slow, but results are cached for next time).
 
         Args:
             study_ids: list of study IDs to pre-load
-            num_workers: number of parallel worker processes
+            num_workers: number of parallel worker processes for DICOM loading
         """
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -337,18 +384,36 @@ class LNQDataset:
             logger.info("All requested studies already in memory")
             return
 
-        logger.info(f"Pre-loading {len(to_load)} studies using {num_workers} workers...")
+        # Phase 1: load from local cache (fast, single-threaded is fine for .npz)
+        cache_hits = 0
+        still_need = []
+        for sid in to_load:
+            study = self._load_from_cache(sid)
+            if study is not None:
+                self._studies[sid] = study
+                cache_hits += 1
+            else:
+                still_need.append(sid)
 
-        # Use ProcessPoolExecutor for true parallelism (GIL-free)
-        # Each worker loads one study independently
+        if cache_hits > 0:
+            logger.info(f"Loaded {cache_hits}/{len(to_load)} studies from cache")
+
+        if not still_need:
+            return
+
+        # Phase 2: load from DICOM source in parallel
+        if num_workers < 0:
+            from ecoseg import available_workers
+            num_workers = available_workers()
+        logger.info(f"Loading {len(still_need)} studies from DICOM using {num_workers} workers...")
+
         loaded = 0
         failed = 0
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all jobs
             future_to_sid = {
                 executor.submit(_load_study_worker, self._index[sid], sid): sid
-                for sid in to_load
+                for sid in still_need
             }
 
             for future in as_completed(future_to_sid):
@@ -356,14 +421,16 @@ class LNQDataset:
                 try:
                     study = future.result()
                     self._studies[sid] = study
+                    # Save to cache for next time
+                    self._save_to_cache(study)
                     loaded += 1
-                    if loaded % 20 == 0 or loaded == len(to_load):
-                        logger.info(f"  Pre-loaded {loaded}/{len(to_load)} studies")
+                    if loaded % 20 == 0 or loaded == len(still_need):
+                        logger.info(f"  Loaded {loaded}/{len(still_need)} from DICOM")
                 except Exception as e:
                     logger.warning(f"  Failed to load {sid}: {e}")
                     failed += 1
 
-        logger.info(f"Pre-loading complete: {loaded} loaded, {failed} failed")
+        logger.info(f"Pre-loading complete: {cache_hits} cached, {loaded} from DICOM, {failed} failed")
 
     def get_fully_annotated_ids(self) -> list[str]:
         """Return study IDs with full annotations."""

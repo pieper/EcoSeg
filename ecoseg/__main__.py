@@ -36,6 +36,8 @@ def main():
     run_parser.add_argument("--architecture", type=str, default="cnn3",
                             choices=["cnn3", "resnet"],
                             help="Species model architecture")
+    run_parser.add_argument("--cache-dir", type=str, default=None,
+                            help="Local directory to cache loaded studies as .npz")
 
     args = parser.parse_args()
 
@@ -62,6 +64,7 @@ def main():
         config.output_dir = args.output_dir
         config.device = args.device
         config.architecture = args.architecture
+        config.cache_dir = args.cache_dir
 
         runner = ExperimentRunner(config)
         results = runner.run_full_experiment()

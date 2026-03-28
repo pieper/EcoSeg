@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from ecoseg import available_workers
 from ecoseg.models.species import SpeciesRegistry
 from ecoseg.models.trainer import TrainingConfig, train_species, normalize_ct, extract_patches
 from ecoseg.models.inference import InferenceConfig, infer_volume
@@ -49,6 +50,9 @@ class ExperimentConfig:
 
     # Device
     device: str = "auto"
+
+    # Cache
+    cache_dir: Optional[str] = None
 
     def resolve_device(self) -> torch.device:
         if self.device == "auto":
@@ -118,12 +122,13 @@ class ExperimentRunner:
     def setup(self) -> None:
         """Initialize dataset, pre-load all studies, and create species."""
         # Load dataset
-        self.dataset = LNQDataset(Path(self.config.data_root))
+        cache_path = Path(self.config.cache_dir) if self.config.cache_dir else None
+        self.dataset = LNQDataset(Path(self.config.data_root), cache_dir=cache_path)
         self.dataset.discover_studies()
 
         # Pre-load ALL studies in parallel using all available cores
         all_ids = list(self.dataset._index.keys())
-        self.dataset.preload_studies(all_ids, num_workers=16)
+        self.dataset.preload_studies(all_ids)
 
         # Create species
         for name in self.config.species_names:
@@ -136,10 +141,10 @@ class ExperimentRunner:
 
     def train_on_studies(
         self,
-        study_ids: list[str],
-        annotation_type: str = "fully_annotated",
+        fully_ids: list[str],
+        partial_ids: list[str],
     ) -> float:
-        """Train all species on a set of studies.
+        """Train all species on accumulated fully + partially annotated studies.
 
         For fully-annotated studies:
           - lymph_node species: positive = labeled voxels
@@ -148,46 +153,59 @@ class ExperimentRunner:
         For partially-annotated studies:
           - lymph_node species: positive = labeled voxels
           - background species: positive = 1-voxel dilation ring around labels
-            (known true negatives, as described in the plan)
+
+        Species models are re-initialized before each training round so they
+        learn from the full accumulated dataset, not incrementally from stale weights.
 
         Returns training time in seconds.
         """
+        from scipy import ndimage
+
         t0 = time.time()
+
+        # Re-initialize species weights to avoid accumulating bias
+        for name in self.config.species_names:
+            species = self.registry.species[name]
+            from ecoseg.models.species import ARCHITECTURES
+            species.network = ARCHITECTURES[species.architecture]().to(self.device)
 
         volumes = []
         ln_masks = []
         bg_masks = []
 
-        for sid in study_ids:
+        def _prepare_study(sid: str, annotation_type: str):
             study = self.dataset.load_study(sid)
             vol = normalize_ct(study.volume)
             volumes.append(vol)
 
             if study.seg_mask is None:
-                continue
+                return
 
-            # Lymph node positive mask
             ln_mask = (study.seg_mask > 0).astype(np.uint8)
             ln_masks.append(ln_mask)
 
             if annotation_type == "fully_annotated":
-                # Background = everything that isn't lymph node
                 bg_mask = (study.seg_mask == 0).astype(np.uint8)
             else:
-                # Partially annotated: true negatives from 1-voxel dilation ring
-                # Only dilate in high-resolution axes for thick slices
                 if study.spacing[0] > 3.0:
-                    # Thick slices: dilate only in-plane (axial)
                     struct = np.zeros((3, 3, 3), dtype=bool)
-                    struct[1, :, :] = True  # Only center slice, full in-plane
+                    struct[1, :, :] = True
                 else:
                     struct = np.ones((3, 3, 3), dtype=bool)
-
-                from scipy import ndimage
                 dilated = ndimage.binary_dilation(ln_mask.astype(bool), struct)
                 bg_mask = (dilated & ~ln_mask.astype(bool)).astype(np.uint8)
 
             bg_masks.append(bg_mask)
+
+        for sid in fully_ids:
+            _prepare_study(sid, "fully_annotated")
+        for sid in partial_ids:
+            _prepare_study(sid, "partially_annotated")
+
+        logger.info(
+            f"Training on {len(fully_ids)} full + {len(partial_ids)} partial scans "
+            f"({len(ln_masks)} with LN masks, {len(bg_masks)} with BG masks)"
+        )
 
         # Train lymph node species
         ln_species = self.registry.species["lymph_node"]
@@ -238,7 +256,7 @@ class ExperimentRunner:
         # Use threads for scoring (scipy releases GIL during distance_transform)
         scoring_futures = []
 
-        with ThreadPoolExecutor(max_workers=8) as scorer:
+        with ThreadPoolExecutor(max_workers=available_workers()) as scorer:
             for i, sid in enumerate(study_ids):
                 study = self.dataset.load_study(sid)
                 vol = normalize_ct(study.volume)
@@ -272,25 +290,27 @@ class ExperimentRunner:
 
     def run_generation(
         self,
-        train_ids: list[str],
+        fully_ids: list[str],
+        partial_ids: list[str],
         eval_ids: list[str],
-        annotation_type: str = "fully_annotated",
     ) -> GenerationResult:
-        """Run one generation: train on train_ids, evaluate on eval_ids."""
+        """Run one generation: train on all accumulated data, evaluate on eval_ids."""
         gen = len(self.results)
+        total_train = len(fully_ids) + len(partial_ids)
         logger.info(
-            f"=== Generation {gen}: training on {len(train_ids)} scans, "
+            f"=== Generation {gen}: training on {total_train} scans "
+            f"({len(fully_ids)} full + {len(partial_ids)} partial), "
             f"evaluating on {len(eval_ids)} ==="
         )
 
-        train_time = self.train_on_studies(train_ids, annotation_type)
+        train_time = self.train_on_studies(fully_ids, partial_ids)
         scores, infer_time = self.evaluate(eval_ids)
 
         finite_assd = [s.assd for s in scores if np.isfinite(s.assd)]
 
         result = GenerationResult(
             generation=gen,
-            num_training_scans=len(train_ids),
+            num_training_scans=total_train,
             scores=scores,
             mean_dice=np.mean([s.dice for s in scores]) if scores else 0.0,
             mean_assd=np.mean(finite_assd) if finite_assd else float("inf"),
@@ -315,7 +335,11 @@ class ExperimentRunner:
 
         1. Train on 20 validation scans (fully annotated)
         2. Evaluate on 100 test scans
-        3. Add partial scans in batches of 20, retrain, re-evaluate
+        3. Incrementally add partial scans in batches of 20
+        4. Retrain on ALL accumulated data each generation, re-evaluate
+
+        Training is cumulative: each generation trains on the 20 fully-
+        annotated scans PLUS all partial scans added so far.
         """
         self.setup()
 
@@ -327,19 +351,38 @@ class ExperimentRunner:
             f"Test: {len(test_ids)} studies"
         )
 
-        # Generation 0: train on fully-annotated validation set
-        self.run_generation(validation_ids, test_ids, "fully_annotated")
+        # Accumulate training data across generations
+        # fully_annotated IDs are always included
+        self._fully_annotated_ids = list(validation_ids)
+        self._partial_annotated_ids: list[str] = []
+
+        # Generation 0: train on fully-annotated validation set only
+        self.run_generation(
+            self._fully_annotated_ids, [], test_ids,
+        )
 
         # Get partially annotated study IDs
         all_ids = set(self.dataset._index.keys())
         fully_ids = set(validation_ids) | set(test_ids)
         partial_ids = sorted(all_ids - fully_ids)
 
-        # Add partial scans in batches
+        # Add partial scans in batches — training is cumulative
         batch_size = self.config.batch_size_partial
         for i in range(0, len(partial_ids), batch_size):
             batch = partial_ids[i:i + batch_size]
-            self.run_generation(batch, test_ids, "partially_annotated")
+            self._partial_annotated_ids.extend(batch)
+
+            logger.info(
+                f"Added {len(batch)} partial scans "
+                f"(total: {len(self._fully_annotated_ids)} full + "
+                f"{len(self._partial_annotated_ids)} partial)"
+            )
+
+            self.run_generation(
+                self._fully_annotated_ids,
+                self._partial_annotated_ids,
+                test_ids,
+            )
 
         logger.info(
             f"Experiment complete: {len(self.results)} generations"
