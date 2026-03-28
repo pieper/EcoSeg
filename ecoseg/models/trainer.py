@@ -18,13 +18,14 @@ from ecoseg.models.species import SpeciesModel
 @dataclass
 class TrainingConfig:
     patch_size: int = 32
-    batch_size: int = 64
+    batch_size: int = 512
     num_epochs: int = 30
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     positive_patches_per_scan: int = 500
     negative_patches_per_scan: int = 500
-    num_workers: int = 0
+    num_workers: int = 16
+    pin_memory: bool = True
 
 
 def augment_patch(patch: torch.Tensor) -> torch.Tensor:
@@ -219,16 +220,14 @@ def train_species(
     if not all_patches:
         return []
 
-    dataset = PatchDataset(
-        patches=torch.cat(all_patches, dim=0),
-        labels=torch.cat(all_labels, dim=0),
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-    )
+    all_patches_t = torch.cat(all_patches, dim=0)
+    all_labels_t = torch.cat(all_labels, dim=0)
+    n_patches = len(all_labels_t)
+
+    # If the dataset fits in GPU memory (<4GB), pre-load to GPU and skip
+    # DataLoader overhead entirely. 10K patches of 32^3 float32 = ~1.3GB.
+    gpu_bytes = all_patches_t.nbytes + all_labels_t.nbytes
+    use_gpu_direct = (str(device) != "cpu" and gpu_bytes < 4 * 1024**3)
 
     species.network.to(device)
     species.network.train()
@@ -236,24 +235,76 @@ def train_species(
     criterion = nn.BCELoss()
 
     epoch_losses = []
-    for epoch in range(config.num_epochs):
-        total_loss = 0.0
-        count = 0
-        for patches_batch, labels_batch in loader:
-            patches_batch = patches_batch.to(device)
-            labels_batch = labels_batch.to(device)
 
-            optimizer.zero_grad()
-            predictions = species.network(patches_batch).squeeze(-1)
-            loss = criterion(predictions, labels_batch)
-            loss.backward()
-            optimizer.step()
+    if use_gpu_direct:
+        # Pre-load everything to GPU — no CPU-GPU transfer during training
+        all_patches_t = all_patches_t.to(device)
+        all_labels_t = all_labels_t.to(device)
 
-            total_loss += loss.item() * len(labels_batch)
-            count += len(labels_batch)
+        for epoch in range(config.num_epochs):
+            # Shuffle indices each epoch
+            perm = torch.randperm(n_patches, device=device)
+            total_loss = 0.0
+            count = 0
+            for start in range(0, n_patches, config.batch_size):
+                idx = perm[start:start + config.batch_size]
+                patches_batch = all_patches_t[idx]
+                labels_batch = all_labels_t[idx]
 
-        avg_loss = total_loss / count if count > 0 else 0.0
-        epoch_losses.append(avg_loss)
+                # Apply augmentation on GPU
+                if patches_batch.shape[0] > 0:
+                    # Random flips along each spatial axis
+                    for dim in (2, 3, 4):
+                        if torch.rand(1).item() > 0.5:
+                            patches_batch = torch.flip(patches_batch, [dim])
+                    # Random intensity jitter
+                    shift = (torch.rand(1, device=device) - 0.5) * 0.1
+                    scale = 0.9 + torch.rand(1, device=device) * 0.2
+                    patches_batch = (patches_batch * scale + shift).clamp(0.0, 1.0)
+
+                optimizer.zero_grad()
+                predictions = species.network(patches_batch).squeeze(-1)
+                loss = criterion(predictions, labels_batch)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * len(labels_batch)
+                count += len(labels_batch)
+
+            avg_loss = total_loss / count if count > 0 else 0.0
+            epoch_losses.append(avg_loss)
+    else:
+        # Fallback: use DataLoader with workers (for CPU or very large datasets)
+        dataset = PatchDataset(
+            patches=all_patches_t,
+            labels=all_labels_t,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory and str(device) != "cpu",
+        )
+
+        for epoch in range(config.num_epochs):
+            total_loss = 0.0
+            count = 0
+            for patches_batch, labels_batch in loader:
+                patches_batch = patches_batch.to(device)
+                labels_batch = labels_batch.to(device)
+
+                optimizer.zero_grad()
+                predictions = species.network(patches_batch).squeeze(-1)
+                loss = criterion(predictions, labels_batch)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * len(labels_batch)
+                count += len(labels_batch)
+
+            avg_loss = total_loss / count if count > 0 else 0.0
+            epoch_losses.append(avg_loss)
 
     species.network.eval()
     species.generation += 1
