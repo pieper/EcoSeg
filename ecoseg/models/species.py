@@ -18,17 +18,19 @@ class ThreeLayerCNN(nn.Module):
     Output: (batch, 1) - fitness score in [0, 1]
     """
 
-    def __init__(self, in_channels: int = 1):
+    def __init__(self, in_channels: int = 1, dropout: float = 0.3):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv3d(in_channels, 16, kernel_size=3, padding=1),
             nn.BatchNorm3d(16),
             nn.ReLU(),
             nn.MaxPool3d(2),  # -> 16x16x16
+            nn.Dropout3d(dropout),
             nn.Conv3d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(),
             nn.MaxPool3d(2),  # -> 8x8x8
+            nn.Dropout3d(dropout),
             nn.Conv3d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(),
@@ -36,6 +38,7 @@ class ThreeLayerCNN(nn.Module):
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
+            nn.Dropout(dropout),
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
@@ -44,9 +47,104 @@ class ThreeLayerCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+class ResBlock3d(nn.Module):
+    """3D residual block with optional downsampling."""
+
+    def __init__(self, channels: int, dropout: float = 0.2):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(channels),
+            nn.ReLU(),
+            nn.Dropout3d(dropout),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(channels),
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(self.block(x) + x)
+
+
+class ResNetSpecies(nn.Module):
+    """Residual species architecture with multi-scale pooling.
+
+    Residual connections help learn "what's different about this patch"
+    rather than memorizing absolute patterns. Multi-scale average pooling
+    captures features at different spatial scales, helping with lymph
+    nodes of varying sizes.
+
+    Input: (batch, 1, 32, 32, 32)
+    Output: (batch, 1) - fitness score in [0, 1]
+    ~300K parameters
+    """
+
+    def __init__(self, in_channels: int = 1, dropout: float = 0.3):
+        super().__init__()
+        # Stem: project to feature channels
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_channels, 24, kernel_size=3, padding=1),
+            nn.BatchNorm3d(24),
+            nn.ReLU(),
+        )
+
+        # Scale 1: 32^3 -> residual -> pool to 16^3
+        self.block1 = ResBlock3d(24, dropout)
+        self.pool1 = nn.MaxPool3d(2)
+
+        # Scale 2: 16^3 -> residual -> pool to 8^3
+        self.up2 = nn.Sequential(
+            nn.Conv3d(24, 48, kernel_size=1),
+            nn.BatchNorm3d(48),
+            nn.ReLU(),
+        )
+        self.block2 = ResBlock3d(48, dropout)
+        self.pool2 = nn.MaxPool3d(2)
+
+        # Scale 3: 8^3 -> residual -> pool to 4^3
+        self.up3 = nn.Sequential(
+            nn.Conv3d(48, 64, kernel_size=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+        )
+        self.block3 = ResBlock3d(64, dropout)
+
+        # Multi-scale pooling: pool each scale to 1x1x1 and concatenate
+        self.gap = nn.AdaptiveAvgPool3d(1)
+
+        # Classifier on concatenated multi-scale features (24 + 48 + 64 = 136)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(136, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Scale 1
+        s1 = self.block1(self.stem(x))
+        g1 = self.gap(s1)
+
+        # Scale 2
+        s2 = self.block2(self.up2(self.pool1(s1)))
+        g2 = self.gap(s2)
+
+        # Scale 3
+        s3 = self.block3(self.up3(self.pool2(s2)))
+        g3 = self.gap(s3)
+
+        # Concatenate multi-scale features
+        multi = torch.cat([g1, g2, g3], dim=1)
+        return self.classifier(multi)
+
+
 # Registry of available architectures
 ARCHITECTURES = {
     "cnn3": ThreeLayerCNN,
+    "resnet": ResNetSpecies,
 }
 
 

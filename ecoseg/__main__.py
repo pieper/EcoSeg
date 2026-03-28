@@ -33,6 +33,9 @@ def main():
     run_parser.add_argument("--config", type=str, default=None)
     run_parser.add_argument("--output-dir", type=str, default="output")
     run_parser.add_argument("--device", type=str, default="auto")
+    run_parser.add_argument("--architecture", type=str, default="cnn3",
+                            choices=["cnn3", "resnet"],
+                            help="Species model architecture")
 
     args = parser.parse_args()
 
@@ -58,6 +61,7 @@ def main():
         config.data_root = args.data_root
         config.output_dir = args.output_dir
         config.device = args.device
+        config.architecture = args.architecture
 
         runner = ExperimentRunner(config)
         results = runner.run_full_experiment()

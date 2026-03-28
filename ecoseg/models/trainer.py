@@ -19,11 +19,30 @@ from ecoseg.models.species import SpeciesModel
 class TrainingConfig:
     patch_size: int = 32
     batch_size: int = 64
-    num_epochs: int = 50
+    num_epochs: int = 30
     learning_rate: float = 1e-3
-    positive_patches_per_scan: int = 200
-    negative_patches_per_scan: int = 200
+    weight_decay: float = 1e-4
+    positive_patches_per_scan: int = 500
+    negative_patches_per_scan: int = 500
     num_workers: int = 0
+
+
+def augment_patch(patch: torch.Tensor) -> torch.Tensor:
+    """Apply random augmentations to a (1, D, H, W) patch.
+
+    Augmentations:
+    - Random flips along each spatial axis
+    - Random intensity shift and scale
+    """
+    # Random flips along each spatial axis
+    for dim in (1, 2, 3):
+        if torch.rand(1).item() > 0.5:
+            patch = torch.flip(patch, [dim])
+    # Random intensity jitter: shift +/- 0.05, scale 0.9-1.1
+    shift = (torch.rand(1).item() - 0.5) * 0.1
+    scale = 0.9 + torch.rand(1).item() * 0.2
+    patch = patch * scale + shift
+    return patch.clamp(0.0, 1.0)
 
 
 class PatchDataset(Dataset):
@@ -38,15 +57,20 @@ class PatchDataset(Dataset):
         self,
         patches: torch.Tensor,
         labels: torch.Tensor,
+        augment: bool = True,
     ):
         self.patches = patches
         self.labels = labels
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.patches[idx], self.labels[idx]
+        patch = self.patches[idx]
+        if self.augment:
+            patch = augment_patch(patch)
+        return patch, self.labels[idx]
 
 
 def extract_patches(
@@ -208,7 +232,7 @@ def train_species(
 
     species.network.to(device)
     species.network.train()
-    optimizer = optim.Adam(species.network.parameters(), lr=config.learning_rate)
+    optimizer = optim.AdamW(species.network.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     criterion = nn.BCELoss()
 
     epoch_losses = []
