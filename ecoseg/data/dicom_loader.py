@@ -394,28 +394,50 @@ class LNQDataset:
             logger.info("All requested studies already in memory")
             return
 
-        # Phase 1: load from local cache
+        # Phase 1: load from local cache in parallel (I/O bound, threads are fine)
+        from concurrent.futures import ThreadPoolExecutor
+
+        if num_workers < 0:
+            from ecoseg import available_workers
+            num_workers = available_workers()
+
         cache_hits = 0
         still_need = []
+
+        # Check which ones have cache files
+        cached_sids = []
         for sid in to_load:
-            study = self._load_from_cache(sid)
-            if study is not None:
-                self._studies[sid] = study
-                cache_hits += 1
+            path = self._cache_path(sid)
+            if path is not None and path.exists():
+                cached_sids.append(sid)
             else:
                 still_need.append(sid)
 
-        if cache_hits > 0:
-            logger.info(f"Loaded {cache_hits}/{len(to_load)} studies from cache")
+        if cached_sids:
+            logger.info(f"Loading {len(cached_sids)} studies from cache using {num_workers} threads...")
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = {
+                    pool.submit(self._load_from_cache, sid): sid
+                    for sid in cached_sids
+                }
+                for future in futures:
+                    sid = futures[future]
+                    try:
+                        study = future.result()
+                        if study is not None:
+                            self._studies[sid] = study
+                            cache_hits += 1
+                        else:
+                            still_need.append(sid)
+                    except Exception:
+                        still_need.append(sid)
+
+            logger.info(f"Loaded {cache_hits}/{len(cached_sids)} studies from cache")
 
         if not still_need:
             return
 
         # Phase 2: workers write .npz to disk, main process reads them back
-        if num_workers < 0:
-            from ecoseg import available_workers
-            num_workers = available_workers()
-
         if self.cache_dir is None:
             # Need a cache dir for the worker strategy to work
             self.cache_dir = Path.home() / ".ecoseg" / "cache"

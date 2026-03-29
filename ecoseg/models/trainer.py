@@ -230,7 +230,7 @@ def train_species(
     gpu_bytes = all_patches_t.nbytes + all_labels_t.nbytes
     # Use GPU direct if data fits in half of available GPU memory
     if str(device) != "cpu" and torch.cuda.is_available():
-        gpu_total = torch.cuda.get_device_properties(0).total_mem
+        gpu_total = torch.cuda.get_device_properties(0).total_memory
         gpu_limit = gpu_total // 2
     else:
         gpu_limit = 0
