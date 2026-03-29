@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GrowCutConfig:
-    max_iterations: int = 500
+    max_iterations: int = 1000
     convergence_threshold: float = 0.0  # 0 = run until no changes at all
+    stop_after_no_change: int = 2  # Stop after N consecutive iterations with 0 changes
 
 
 def growcut_embedding(
@@ -160,14 +161,19 @@ def growcut_embedding(
         strength[seed_mask] = 1.0
 
         total_voxels = D * H * W
-        change_fraction = changed / total_voxels
-        if change_fraction < config.convergence_threshold:
-            n_labeled = (labels > 0).sum().item()
-            logger.info(
-                f"GrowCut (embedding) converged at iteration {iteration + 1}, "
-                f"labeled={n_labeled}/{total_voxels}"
-            )
-            break
+
+        if changed == 0:
+            no_change_count = getattr(config, '_emb_no_change', 0) + 1
+            config._emb_no_change = no_change_count
+            if no_change_count >= config.stop_after_no_change:
+                n_labeled = (labels > 0).sum().item()
+                logger.info(
+                    f"GrowCut (embedding) converged at iteration {iteration + 1}, "
+                    f"labeled={n_labeled}/{total_voxels}"
+                )
+                break
+        else:
+            config._emb_no_change = 0
 
         if (iteration + 1) % 100 == 0:
             n_labeled = (labels > 0).sum().item()
@@ -254,14 +260,19 @@ def growcut_intensity(
         strength[seed_mask] = 1.0
 
         total_voxels = D * H * W
-        change_fraction = changed / total_voxels
-        if change_fraction < config.convergence_threshold:
-            n_labeled = (labels > 0).sum().item()
-            logger.info(
-                f"GrowCut (intensity) converged at iteration {iteration + 1}, "
-                f"labeled={n_labeled}/{total_voxels}"
-            )
-            break
+
+        if changed == 0:
+            no_change_count = getattr(config, '_int_no_change', 0) + 1
+            config._int_no_change = no_change_count
+            if no_change_count >= config.stop_after_no_change:
+                n_labeled = (labels > 0).sum().item()
+                logger.info(
+                    f"GrowCut (intensity) converged at iteration {iteration + 1}, "
+                    f"labeled={n_labeled}/{total_voxels}"
+                )
+                break
+        else:
+            config._int_no_change = 0
 
         if (iteration + 1) % 100 == 0:
             n_labeled = (labels > 0).sum().item()

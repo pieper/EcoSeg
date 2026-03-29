@@ -190,6 +190,26 @@ def run_experiment(args):
 
     gc_config = GrowCutConfig(max_iterations=1000, convergence_threshold=0.0)
 
+    def assign_unlabeled(labels, emb, seeds):
+        """Assign any unlabeled voxels to the species with highest prototype affinity."""
+        unlabeled = labels == 0
+        if not unlabeled.any():
+            return labels
+        emb_norm = F.normalize(emb, dim=0)
+        unique_labels = seeds.unique()
+        unique_labels = unique_labels[unique_labels > 0]
+        best_affinity = torch.full_like(labels, -1, dtype=torch.float32)
+        for lbl in unique_labels:
+            lbl_val = lbl.item()
+            mask = seeds == lbl_val
+            seed_embs = emb_norm[:, mask]
+            proto = F.normalize(seed_embs.mean(dim=1), dim=0)
+            aff = (proto.view(-1, 1, 1, 1) * emb_norm).sum(dim=0)
+            better = unlabeled & (aff > best_affinity)
+            labels[better] = lbl_val
+            best_affinity[better] = aff[better]
+        return labels
+
     viz_cases = []
 
     # Cache for PCA-reduced embeddings
@@ -258,6 +278,8 @@ def run_experiment(args):
             # Embedding GrowCut
             t0 = time.time()
             labels_emb, strength_emb = growcut_embedding(emb_crop, seeds_t, gc_config)
+            # Assign any remaining unlabeled voxels by prototype affinity
+            labels_emb = assign_unlabeled(labels_emb, emb_crop, seeds_t)
             time_emb = time.time() - t0
 
             # Diagnostic: log prototype discrimination (first scan, 50 strokes only)
@@ -297,12 +319,34 @@ def run_experiment(args):
                     "dice_embedding": dice_emb,
                 })
 
-        # Free GPU and CPU memory — don't accumulate all 120 studies
+        # Free ALL GPU and CPU memory before next scan
         del emb_crop, vol_crop_t
         if sid in dataset._studies:
             del dataset._studies[sid]
         torch.cuda.empty_cache()
 
+        # Reset per-config state for stop_after_no_change tracking
+        gc_config._int_no_change = 0
+        gc_config._emb_no_change = 0
+
+        # Per-scan Dice at 50 strokes
+        d_int_50 = [r for r in results["intensity"][50] if r["study_id"] == sid]
+        d_emb_50 = [r for r in results["embedding"][50] if r["study_id"] == sid]
+        di50 = d_int_50[0]["dice"] if d_int_50 else 0
+        de50 = d_emb_50[0]["dice"] if d_emb_50 else 0
+        logger.info(
+            f"  [{i+1}/{len(fully_ids)}] {sid}: "
+            f"Dice@50: int={di50:.3f} emb={de50:.3f}"
+        )
+
+        # Generate and save comparison figure for this scan (50 strokes)
+        _save_per_scan_figure(
+            sid, vol_crop, gt_crop,
+            results, stroke_counts, i,
+            output_dir=cache_dir / "growcut_experiment" / "per_scan",
+        )
+
+        # Running average
         if (i + 1) % 5 == 0 or i + 1 == len(fully_ids):
             parts = []
             for n in [10, 50, 200]:
@@ -310,7 +354,7 @@ def run_experiment(args):
                     di = np.mean([r["dice"] for r in results["intensity"][n]])
                     de = np.mean([r["dice"] for r in results["embedding"][n]])
                     parts.append(f"{n}pt: int={di:.3f} emb={de:.3f}")
-            logger.info(f"  [{i+1}/{len(fully_ids)}] " + ", ".join(parts))
+            logger.info(f"  Running avg: " + ", ".join(parts))
 
     # Save results
     output_dir = cache_dir / "growcut_experiment"
@@ -348,6 +392,114 @@ def run_experiment(args):
         _generate_visualizations(viz_cases, output_dir)
 
     logger.info(f"Results saved to {output_dir}")
+
+
+def _save_per_scan_figure(
+    sid: str,
+    vol_crop: np.ndarray,
+    gt_crop: np.ndarray,
+    results: dict,
+    stroke_counts: list,
+    scan_idx: int,
+    output_dir: Path,
+):
+    """Save a comparison figure for one scan, showing intensity vs embedding
+    GrowCut at 50 strokes. Also overwrites 'latest.png' for live viewing."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get the 50-stroke results for this scan
+    int_results = [r for r in results["intensity"][50] if r["study_id"] == sid]
+    emb_results = [r for r in results["embedding"][50] if r["study_id"] == sid]
+    if not int_results or not emb_results:
+        return
+
+    dice_int = int_results[0]["dice"]
+    dice_emb = emb_results[0]["dice"]
+
+    # Find the slice with most GT
+    gt_per_slice = gt_crop.sum(axis=(1, 2))
+    best_slice = np.argmax(gt_per_slice)
+
+    # Build a Dice-vs-strokes comparison
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
+    # Panel 1: CT + GT
+    axes[0].imshow(vol_crop[best_slice], cmap="gray")
+    if gt_crop[best_slice].any():
+        axes[0].contour(gt_crop[best_slice], levels=[0.5], colors="lime", linewidths=2)
+    axes[0].set_title(f"{sid}\nCT + GT (green)")
+    axes[0].axis("off")
+
+    # Panel 2: Dice vs stroke count for both methods
+    int_dices = []
+    emb_dices = []
+    valid_strokes = []
+    for n in stroke_counts:
+        ir = [r for r in results["intensity"][n] if r["study_id"] == sid]
+        er = [r for r in results["embedding"][n] if r["study_id"] == sid]
+        if ir and er:
+            valid_strokes.append(n)
+            int_dices.append(ir[0]["dice"])
+            emb_dices.append(er[0]["dice"])
+
+    if valid_strokes:
+        axes[1].plot(valid_strokes, int_dices, 'ro-', label='Intensity', markersize=6)
+        axes[1].plot(valid_strokes, emb_dices, 'cs-', label='Embedding', markersize=6)
+        axes[1].set_xlabel("Strokes per class")
+        axes[1].set_ylabel("Dice")
+        axes[1].set_ylim(-0.05, 1.05)
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        axes[1].set_title("Dice vs Strokes")
+
+    # Panel 3: Running average across all scans so far
+    avg_int = []
+    avg_emb = []
+    avg_strokes = []
+    for n in stroke_counts:
+        if results["intensity"][n] and results["embedding"][n]:
+            avg_strokes.append(n)
+            avg_int.append(np.mean([r["dice"] for r in results["intensity"][n]]))
+            avg_emb.append(np.mean([r["dice"] for r in results["embedding"][n]]))
+
+    if avg_strokes:
+        axes[2].plot(avg_strokes, avg_int, 'ro-', label='Intensity', markersize=6)
+        axes[2].plot(avg_strokes, avg_emb, 'cs-', label='Embedding', markersize=6)
+        axes[2].set_xlabel("Strokes per class")
+        axes[2].set_ylabel("Mean Dice")
+        axes[2].set_ylim(-0.05, 1.05)
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        axes[2].set_title(f"Running Average (n={scan_idx+1} scans)")
+
+    # Panel 4: Per-scan Dice histogram at 50 strokes
+    if len(results["intensity"][50]) > 1:
+        all_int = [r["dice"] for r in results["intensity"][50]]
+        all_emb = [r["dice"] for r in results["embedding"][50]]
+        axes[3].hist(all_int, bins=20, alpha=0.6, color='red', label='Intensity')
+        axes[3].hist(all_emb, bins=20, alpha=0.6, color='cyan', label='Embedding')
+        axes[3].set_xlabel("Dice")
+        axes[3].set_ylabel("Count")
+        axes[3].legend()
+        axes[3].set_title("Dice Distribution @50 strokes")
+    else:
+        axes[3].text(0.5, 0.5, "Collecting...", ha='center', va='center', fontsize=14)
+        axes[3].axis("off")
+
+    fig.suptitle(
+        f"Scan {scan_idx+1}: {sid} — Dice@50: Intensity={dice_int:.3f}, Embedding={dice_emb:.3f}",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout()
+
+    # Save per-scan and latest
+    fig.savefig(output_dir / f"{scan_idx:03d}_{sid}.png", dpi=120)
+    fig.savefig(output_dir.parent / "latest.png", dpi=120)
+    plt.close(fig)
 
 
 def _generate_visualizations(viz_cases: list, output_dir: Path):
