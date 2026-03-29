@@ -126,42 +126,41 @@ def encode_crop(
 
         emb = inferer(vol_t, _encode_patch)
 
-    # Crop back to original size: (1, 720, D, H, W)
-    emb = emb[:, :, :D, :H, :W].squeeze(0)  # (720, D, H, W)
+    # Move to CPU for PCA — 720-dim embeddings are too large for GPU PCA
+    emb = emb[:, :, :D, :H, :W].squeeze(0).cpu()  # (720, D, H, W)
 
-    # PCA reduction on GPU: 720 -> target_dim
+    # Free GPU memory from encoder
+    del vol_t
+    torch.cuda.empty_cache()
+
+    # PCA reduction on CPU: 720 -> target_dim
     C = emb.shape[0]
-    flat = emb.reshape(C, -1)  # (720, N) where N = D*H*W
+    flat = emb.reshape(C, -1)  # (720, N)
 
-    # Center the data
-    mean = flat.mean(dim=1, keepdim=True)  # (720, 1)
+    mean = flat.mean(dim=1, keepdim=True)
     centered = flat - mean
 
-    # Compute covariance and top eigenvectors via SVD on a subsample
-    # (full SVD on 720×N is too expensive; subsample N to 50K)
+    # SVD on subsample to find principal components
     N = centered.shape[1]
-    if N > 50000:
-        idx = torch.randperm(N, device=device)[:50000]
-        subsample = centered[:, idx]  # (720, 50000)
-    else:
-        subsample = centered
+    n_subsample = min(50000, N)
+    idx = torch.randperm(N)[:n_subsample]
+    subsample = centered[:, idx]  # (720, n_subsample)
 
-    # SVD: subsample = U @ S @ Vt, we want the top target_dim columns of U
     U, S, _ = torch.linalg.svd(subsample, full_matrices=False)
     components = U[:, :target_dim]  # (720, target_dim)
 
-    # Project all voxels: (target_dim, 720) @ (720, N) -> (target_dim, N)
+    # Project all voxels
     projected = components.T @ centered  # (target_dim, N)
-
-    # Reshape back to spatial
     result = projected.reshape(target_dim, D, H, W)
 
+    var_explained = (S[:target_dim]**2).sum() / (S**2).sum()
     logger.info(
         f"PCA: 720 -> {target_dim} dims, "
-        f"variance explained: {(S[:target_dim]**2).sum() / (S**2).sum():.1%}"
+        f"variance explained: {var_explained:.1%}"
     )
 
-    return result
+    # Move result to GPU for GrowCut
+    return result.to(device)
 
 
 def run_experiment(args):
