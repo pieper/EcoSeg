@@ -29,7 +29,7 @@ from typing import Optional
 from ecoseg.data.dicom_loader import LNQDataset
 from ecoseg.models.ecosegnet import EcoSegNet, EncoderConfig
 from ecoseg.models.growcut_embedding import (
-    growcut_embedding, growcut_intensity,
+    growcut_embedding, growcut_intensity, growcut_learned_per_species,
     simulate_paint_strokes, GrowCutConfig,
 )
 from ecoseg.models.trainer import normalize_ct
@@ -185,7 +185,7 @@ def run_experiment(args):
     model = EcoSegNet(enc_config).to(device)
 
     stroke_counts = [5, 10, 20, 50, 100, 200]
-    methods = ["intensity", "embedding"]
+    methods = ["intensity", "embedding", "learned"]
     results = {m: {n: [] for n in stroke_counts} for m in methods}
 
     gc_config = GrowCutConfig(max_iterations=1000, convergence_threshold=0.0)
@@ -270,37 +270,35 @@ def run_experiment(args):
             time_int = time.time() - t0
             pred_int = (labels_int == 1).cpu().numpy().astype(np.uint8)
             dice_int = dice_score(pred_int, gt_crop)
-
             results["intensity"][n_strokes].append({
                 "study_id": sid, "dice": float(dice_int), "time_s": time_int,
             })
+            logger.info(f"    {n_strokes:3d} strokes — intensity: {dice_int:.3f} ({time_int:.1f}s)")
 
             # Embedding GrowCut
             t0 = time.time()
             labels_emb, strength_emb = growcut_embedding(emb_crop, seeds_t, gc_config)
             time_emb = time.time() - t0
-
-            # Diagnostic: log prototype discrimination (first scan, 50 strokes only)
-            if i == 0 and n_strokes == 50:
-                emb_norm = F.normalize(emb_crop, dim=0)
-                gt_crop_t = torch.tensor(gt_crop, device=device)
-                for lbl in [1, 2]:
-                    mask = seeds_t == lbl
-                    if mask.sum() > 0:
-                        seed_embs = emb_norm[:, mask]
-                        proto = F.normalize(seed_embs.mean(dim=1), dim=0)
-                        aff = (proto.view(-1,1,1,1) * emb_norm).sum(dim=0)
-                        fg_aff = aff[gt_crop_t == 1].mean().item()
-                        bg_aff = aff[gt_crop_t == 0].mean().item()
-                        logger.info(f"  Prototype {lbl}: FG_affinity={fg_aff:.3f}, BG_affinity={bg_aff:.3f}")
-                logger.info(f"  Int unlabeled: {(labels_int==0).sum().item()}, Emb unlabeled: {(labels_emb==0).sum().item()}")
-                logger.info(f"  Predictions identical: {torch.equal(labels_int, labels_emb)}")
             pred_emb = (labels_emb == 1).cpu().numpy().astype(np.uint8)
             dice_emb = dice_score(pred_emb, gt_crop)
-
             results["embedding"][n_strokes].append({
                 "study_id": sid, "dice": float(dice_emb), "time_s": time_emb,
             })
+            logger.info(f"    {' ':3s}          embedding: {dice_emb:.3f} ({time_emb:.1f}s)")
+
+            # Learned GrowCut (species classifiers trained on seed embeddings)
+            t0 = time.time()
+            labels_lrn, strength_lrn = growcut_learned_per_species(
+                emb_crop, seeds_t, gc_config, num_classifier_epochs=50,
+            )
+            time_lrn = time.time() - t0
+            pred_lrn = (labels_lrn == 1).cpu().numpy().astype(np.uint8)
+            dice_lrn = dice_score(pred_lrn, gt_crop)
+
+            results["learned"][n_strokes].append({
+                "study_id": sid, "dice": float(dice_lrn), "time_s": time_lrn,
+            })
+            logger.info(f"    {' ':3s}          learned:   {dice_lrn:.3f} ({time_lrn:.1f}s)")
 
             # Save data for visualization (first 3 cases, 50 strokes)
             if len(viz_cases) < 3 and n_strokes == 50:
@@ -311,6 +309,7 @@ def run_experiment(args):
                     "seeds": seeds_np,
                     "pred_intensity": pred_int,
                     "pred_embedding": pred_emb,
+                    "pred_learned": pred_lrn,
                     "strength_intensity": strength_int.cpu().numpy(),
                     "strength_embedding": strength_emb.cpu().numpy(),
                     "dice_intensity": dice_int,
@@ -328,13 +327,12 @@ def run_experiment(args):
         gc_config._emb_no_change = 0
 
         # Per-scan Dice at 50 strokes
-        d_int_50 = [r for r in results["intensity"][50] if r["study_id"] == sid]
-        d_emb_50 = [r for r in results["embedding"][50] if r["study_id"] == sid]
-        di50 = d_int_50[0]["dice"] if d_int_50 else 0
-        de50 = d_emb_50[0]["dice"] if d_emb_50 else 0
+        di50 = next((r["dice"] for r in results["intensity"][50] if r["study_id"] == sid), 0)
+        de50 = next((r["dice"] for r in results["embedding"][50] if r["study_id"] == sid), 0)
+        dl50 = next((r["dice"] for r in results["learned"][50] if r["study_id"] == sid), 0)
         logger.info(
             f"  [{i+1}/{len(fully_ids)}] {sid}: "
-            f"Dice@50: int={di50:.3f} emb={de50:.3f}"
+            f"Dice@50: int={di50:.3f} emb={de50:.3f} learned={dl50:.3f}"
         )
 
         # Generate and save comparison figure for this scan (50 strokes)
@@ -348,10 +346,11 @@ def run_experiment(args):
         if (i + 1) % 5 == 0 or i + 1 == len(fully_ids):
             parts = []
             for n in [10, 50, 200]:
-                if results["intensity"][n] and results["embedding"][n]:
+                if results["intensity"][n] and results["learned"][n]:
                     di = np.mean([r["dice"] for r in results["intensity"][n]])
                     de = np.mean([r["dice"] for r in results["embedding"][n]])
-                    parts.append(f"{n}pt: int={di:.3f} emb={de:.3f}")
+                    dl = np.mean([r["dice"] for r in results["learned"][n]])
+                    parts.append(f"{n}pt: int={di:.3f} emb={de:.3f} lrn={dl:.3f}")
             logger.info(f"  Running avg: " + ", ".join(parts))
 
     # Save results
@@ -378,12 +377,13 @@ def run_experiment(args):
 
     # Print summary table
     logger.info("\n=== Results Summary ===")
-    logger.info(f"{'Strokes':>8} | {'Intensity Dice':>15} | {'Embedding Dice':>15}")
-    logger.info("-" * 45)
+    logger.info(f"{'Strokes':>8} | {'Intensity':>10} | {'Embedding':>10} | {'Learned':>10}")
+    logger.info("-" * 50)
     for n in stroke_counts:
         di = summary["intensity"].get(f"{n}_strokes", {}).get("mean_dice", 0)
         de = summary["embedding"].get(f"{n}_strokes", {}).get("mean_dice", 0)
-        logger.info(f"{n:>8} | {di:>15.3f} | {de:>15.3f}")
+        dl = summary["learned"].get(f"{n}_strokes", {}).get("mean_dice", 0)
+        logger.info(f"{n:>8} | {di:>10.3f} | {de:>10.3f} | {dl:>10.3f}")
 
     # Generate visualization
     if viz_cases:
@@ -412,18 +412,20 @@ def _save_per_scan_figure(
     # Get the 50-stroke results for this scan
     int_results = [r for r in results["intensity"][50] if r["study_id"] == sid]
     emb_results = [r for r in results["embedding"][50] if r["study_id"] == sid]
-    if not int_results or not emb_results:
+    lrn_results = [r for r in results["learned"][50] if r["study_id"] == sid]
+    if not int_results:
         return
 
-    dice_int = int_results[0]["dice"]
-    dice_emb = emb_results[0]["dice"]
+    dice_int = int_results[0]["dice"] if int_results else 0
+    dice_emb = emb_results[0]["dice"] if emb_results else 0
+    dice_lrn = lrn_results[0]["dice"] if lrn_results else 0
 
     # Find the slice with most GT
     gt_per_slice = gt_crop.sum(axis=(1, 2))
     best_slice = np.argmax(gt_per_slice)
 
     # Build a Dice-vs-strokes comparison
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
 
     # Panel 1: CT + GT
     axes[0].imshow(vol_crop[best_slice], cmap="gray")
@@ -435,18 +437,22 @@ def _save_per_scan_figure(
     # Panel 2: Dice vs stroke count for both methods
     int_dices = []
     emb_dices = []
+    lrn_dices = []
     valid_strokes = []
     for n in stroke_counts:
         ir = [r for r in results["intensity"][n] if r["study_id"] == sid]
         er = [r for r in results["embedding"][n] if r["study_id"] == sid]
-        if ir and er:
+        lr = [r for r in results["learned"][n] if r["study_id"] == sid]
+        if ir:
             valid_strokes.append(n)
             int_dices.append(ir[0]["dice"])
-            emb_dices.append(er[0]["dice"])
+            emb_dices.append(er[0]["dice"] if er else 0)
+            lrn_dices.append(lr[0]["dice"] if lr else 0)
 
     if valid_strokes:
         axes[1].plot(valid_strokes, int_dices, 'ro-', label='Intensity', markersize=6)
         axes[1].plot(valid_strokes, emb_dices, 'cs-', label='Embedding', markersize=6)
+        axes[1].plot(valid_strokes, lrn_dices, 'g^-', label='Learned', markersize=6)
         axes[1].set_xlabel("Strokes per class")
         axes[1].set_ylabel("Dice")
         axes[1].set_ylim(-0.05, 1.05)
@@ -457,16 +463,19 @@ def _save_per_scan_figure(
     # Panel 3: Running average across all scans so far
     avg_int = []
     avg_emb = []
+    avg_lrn = []
     avg_strokes = []
     for n in stroke_counts:
-        if results["intensity"][n] and results["embedding"][n]:
+        if results["intensity"][n]:
             avg_strokes.append(n)
             avg_int.append(np.mean([r["dice"] for r in results["intensity"][n]]))
-            avg_emb.append(np.mean([r["dice"] for r in results["embedding"][n]]))
+            avg_emb.append(np.mean([r["dice"] for r in results["embedding"][n]]) if results["embedding"][n] else 0)
+            avg_lrn.append(np.mean([r["dice"] for r in results["learned"][n]]) if results["learned"][n] else 0)
 
     if avg_strokes:
         axes[2].plot(avg_strokes, avg_int, 'ro-', label='Intensity', markersize=6)
         axes[2].plot(avg_strokes, avg_emb, 'cs-', label='Embedding', markersize=6)
+        axes[2].plot(avg_strokes, avg_lrn, 'g^-', label='Learned', markersize=6)
         axes[2].set_xlabel("Strokes per class")
         axes[2].set_ylabel("Mean Dice")
         axes[2].set_ylim(-0.05, 1.05)
@@ -478,8 +487,10 @@ def _save_per_scan_figure(
     if len(results["intensity"][50]) > 1:
         all_int = [r["dice"] for r in results["intensity"][50]]
         all_emb = [r["dice"] for r in results["embedding"][50]]
-        axes[3].hist(all_int, bins=20, alpha=0.6, color='red', label='Intensity')
-        axes[3].hist(all_emb, bins=20, alpha=0.6, color='cyan', label='Embedding')
+        all_lrn = [r["dice"] for r in results["learned"][50]]
+        axes[3].hist(all_int, bins=20, alpha=0.5, color='red', label='Intensity')
+        axes[3].hist(all_emb, bins=20, alpha=0.5, color='cyan', label='Embedding')
+        axes[3].hist(all_lrn, bins=20, alpha=0.5, color='green', label='Learned')
         axes[3].set_xlabel("Dice")
         axes[3].set_ylabel("Count")
         axes[3].legend()
@@ -489,7 +500,7 @@ def _save_per_scan_figure(
         axes[3].axis("off")
 
     fig.suptitle(
-        f"Scan {scan_idx+1}: {sid} — Dice@50: Intensity={dice_int:.3f}, Embedding={dice_emb:.3f}",
+        f"Scan {scan_idx+1}: {sid} — Dice@50: Intensity={dice_int:.3f}, Embedding={dice_emb:.3f}, Learned={dice_lrn:.3f}",
         fontsize=13, fontweight="bold",
     )
     fig.tight_layout()
