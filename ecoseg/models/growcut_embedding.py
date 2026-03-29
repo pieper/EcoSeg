@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GrowCutConfig:
-    max_iterations: int = 200
-    convergence_threshold: float = 0.001  # Fraction of voxels still changing
+    max_iterations: int = 500
+    convergence_threshold: float = 0.0  # 0 = run until no changes at all
 
 
 def growcut_embedding(
@@ -117,13 +117,18 @@ def growcut_embedding(
             neighbor_strength = torch.roll(strength, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
 
             # Boundary mask
+            # Mask out boundary voxels where the rolled neighbor wraps around.
+            # For offset dz=-1 (neighbor at z-1): z=0 has no z-1 neighbor,
+            # but roll brings z=-1 (=last slice) into position 0, so mask z=0.
+            # For offset dz=+1 (neighbor at z+1): z=last has no z+1 neighbor,
+            # but roll brings z=0 into position last, so mask z=last.
             boundary_mask = torch.ones(D, H, W, device=device, dtype=torch.bool)
-            if dz == -1: boundary_mask[-1, :, :] = False
-            elif dz == 1: boundary_mask[0, :, :] = False
-            if dy == -1: boundary_mask[:, -1, :] = False
-            elif dy == 1: boundary_mask[:, 0, :] = False
-            if dx == -1: boundary_mask[:, :, -1] = False
-            elif dx == 1: boundary_mask[:, :, 0] = False
+            if dz == -1: boundary_mask[0, :, :] = False
+            elif dz == 1: boundary_mask[-1, :, :] = False
+            if dy == -1: boundary_mask[:, 0, :] = False
+            elif dy == 1: boundary_mask[:, -1, :] = False
+            if dx == -1: boundary_mask[:, :, 0] = False
+            elif dx == 1: boundary_mask[:, :, -1] = False
 
             # Local similarity: how similar is the center voxel to the
             # attacking neighbor? (boundary detection, just like classic GrowCut)
@@ -140,7 +145,7 @@ def growcut_embedding(
                 can_attack = (
                     boundary_mask
                     & (neighbor_labels == lbl_val)
-                    & (attack > new_strength)
+                    & ((attack > new_strength) | ((new_labels == 0) & (attack > 0)))
                 )
 
                 new_labels[can_attack] = lbl_val
@@ -210,19 +215,14 @@ def growcut_intensity(
             neighbor_labels = torch.roll(labels, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
             neighbor_strength = torch.roll(strength, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
 
+            # Mask out boundary voxels where the rolled neighbor wraps around
             boundary_mask = torch.ones(D, H, W, device=device, dtype=torch.bool)
-            if dz == -1:
-                boundary_mask[-1, :, :] = False
-            elif dz == 1:
-                boundary_mask[0, :, :] = False
-            if dy == -1:
-                boundary_mask[:, -1, :] = False
-            elif dy == 1:
-                boundary_mask[:, 0, :] = False
-            if dx == -1:
-                boundary_mask[:, :, -1] = False
-            elif dx == 1:
-                boundary_mask[:, :, 0] = False
+            if dz == -1: boundary_mask[0, :, :] = False
+            elif dz == 1: boundary_mask[-1, :, :] = False
+            if dy == -1: boundary_mask[:, 0, :] = False
+            elif dy == 1: boundary_mask[:, -1, :] = False
+            if dx == -1: boundary_mask[:, :, 0] = False
+            elif dx == 1: boundary_mask[:, :, -1] = False
 
             # Fitness: 1 - normalized intensity difference
             fitness = 1.0 - torch.abs(volume - neighbor_vol)
@@ -233,7 +233,7 @@ def growcut_intensity(
             wins = (
                 boundary_mask
                 & (neighbor_labels > 0)
-                & (attack > new_strength)
+                & ((attack > new_strength) | ((new_labels == 0) & (attack > 0)))
             )
 
             new_labels[wins] = neighbor_labels[wins]
