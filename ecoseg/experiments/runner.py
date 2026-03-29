@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExperimentConfig:
     """Configuration for an LNQ experiment run."""
-    name: str = "baseline_20-100_cnn3_batch20"
+    name: str = ""  # Auto-generated if empty
     data_root: str = ""
     output_dir: str = "output"
 
@@ -121,6 +121,13 @@ class ExperimentRunner:
         self.registry: Optional[SpeciesRegistry] = None
         self.ecosegnet: Optional['EcoSegNet'] = None
         self.emb_cache: Optional['EmbeddingCache'] = None
+
+        # Auto-generate experiment name if not set
+        if not config.name:
+            if config.model_type == "encoder":
+                config.name = f"encoder_f{config.feature_dim}_batch{config.batch_size_partial}"
+            else:
+                config.name = f"species_{config.architecture}_batch{config.batch_size_partial}"
 
         # Output directory
         self.output_dir = Path(config.output_dir) / config.name
@@ -682,14 +689,31 @@ class ExperimentRunner:
         and all generation results.
         """
         ckpt_path = self.output_dir / "checkpoint.pt"
+
+        # Save model-type-specific state
+        if self.config.model_type == "species" and self.registry is not None:
+            model_states = {
+                "species_states": {
+                    name: species.state_dict()
+                    for name, species in self.registry.species.items()
+                }
+            }
+        elif self.config.model_type == "encoder" and self.ecosegnet is not None:
+            model_states = {
+                "head_states": {
+                    name: head.state_dict()
+                    for name, head in self.ecosegnet.species_heads.items()
+                }
+            }
+        else:
+            model_states = {}
+
         ckpt = {
+            "model_type": self.config.model_type,
             "generation": len(self.results),
             "fully_annotated_ids": getattr(self, '_fully_annotated_ids', []),
             "partial_annotated_ids": getattr(self, '_partial_annotated_ids', []),
-            "species_states": {
-                name: species.state_dict()
-                for name, species in self.registry.species.items()
-            },
+            **model_states,
             "results": [
                 {
                     "generation": r.generation,
@@ -717,13 +741,28 @@ class ExperimentRunner:
 
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        # Restore species weights
-        from ecoseg.models.species import SpeciesModel
-        for name, state in ckpt["species_states"].items():
-            if name in self.registry.species:
-                self.registry.species[name] = SpeciesModel.from_state_dict(
-                    state, device=self.device
-                )
+        # Check model type matches
+        ckpt_model_type = ckpt.get("model_type", "species")
+        if ckpt_model_type != self.config.model_type:
+            logger.warning(
+                f"Checkpoint model type '{ckpt_model_type}' doesn't match "
+                f"config '{self.config.model_type}', skipping"
+            )
+            return False
+
+        # Restore species/head weights
+        if self.config.model_type == "species" and self.registry is not None:
+            from ecoseg.models.species import SpeciesModel
+            for name, state in ckpt.get("species_states", {}).items():
+                if name in self.registry.species:
+                    self.registry.species[name] = SpeciesModel.from_state_dict(
+                        state, device=self.device
+                    )
+        elif self.config.model_type == "encoder" and self.ecosegnet is not None:
+            head_states = ckpt.get("head_states", {})
+            for name, state in head_states.items():
+                if name in self.ecosegnet.species_heads:
+                    self.ecosegnet.species_heads[name].load_state_dict(state)
 
         # Restore accumulated IDs
         self._fully_annotated_ids = ckpt["fully_annotated_ids"]
