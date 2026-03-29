@@ -1,16 +1,17 @@
 """GrowCut on embeddings experiment.
 
-Compares three methods:
+Compares three methods on the 120 fully-annotated LNQ2023 scans:
 1. Traditional GrowCut (intensity similarity)
 2. Embedding GrowCut (cosine similarity of SwinUNETR features)
 3. (Future) Learned discriminator GrowCut
 
-Usage:
-    # Step 1: Precompute embeddings (one-time)
-    python -m ecoseg.experiments.growcut_experiment precompute \
-        --data-root /path/to/lnq --cache-dir /media/volume/EcoSegCache --device cuda
+Efficiency:
+- Only encodes the 120 fully-annotated scans (not all 513)
+- Crops to a ROI ~10cm past the lymph node label extents
+- Computes embeddings only on the cropped region
+- Re-uses zarr-cached CT volumes (no DICOM re-reading)
 
-    # Step 2: Run experiment (fast)
+Usage:
     python -m ecoseg.experiments.growcut_experiment run \
         --data-root /path/to/lnq --cache-dir /media/volume/EcoSegCache --device cuda
 """
@@ -21,11 +22,12 @@ import logging
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pathlib import Path
+from typing import Optional
 
 from ecoseg.data.dicom_loader import LNQDataset
 from ecoseg.models.ecosegnet import EcoSegNet, EncoderConfig
-from ecoseg.models.embedding_cache import EmbeddingCache
 from ecoseg.models.growcut_embedding import (
     growcut_embedding, growcut_intensity,
     simulate_paint_strokes, GrowCutConfig,
@@ -36,53 +38,95 @@ from ecoseg.metrics.scoring import dice_score
 logger = logging.getLogger(__name__)
 
 
-def precompute_embeddings(args):
-    """Precompute and cache embeddings for all fully-annotated scans."""
-    device = torch.device(args.device)
+def compute_roi(
+    mask: np.ndarray,
+    spacing: tuple[float, float, float],
+    margin_mm: float = 100.0,
+    volume_shape: tuple[int, int, int] = None,
+) -> tuple[slice, slice, slice]:
+    """Compute a bounding box ROI around the mask with a margin in mm.
 
-    dataset = LNQDataset(Path(args.data_root), cache_dir=Path(args.cache_dir))
-    dataset.discover_studies()
+    Args:
+        mask: (D, H, W) binary mask
+        spacing: (sz, sy, sx) voxel spacing in mm
+        margin_mm: margin to add around the mask extents in mm
+        volume_shape: (D, H, W) to clamp the ROI
 
-    logger.info("Pre-loading studies...")
-    all_ids = list(dataset._index.keys())
-    dataset.preload_studies(all_ids)
+    Returns:
+        Tuple of 3 slices defining the ROI
+    """
+    if volume_shape is None:
+        volume_shape = mask.shape
 
-    config = EncoderConfig(feature_dim=args.feature_dim, pretrained=True)
-    model = EcoSegNet(config).to(device)
-    emb_cache = EmbeddingCache(Path(args.cache_dir), feature_dim=args.feature_dim)
+    coords = np.argwhere(mask > 0)
+    if len(coords) == 0:
+        return (slice(0, volume_shape[0]), slice(0, volume_shape[1]), slice(0, volume_shape[2]))
 
-    fully_ids = dataset.get_validation_ids(20) + dataset.get_test_ids(20)
-    logger.info(f"Encoding {len(fully_ids)} fully-annotated studies...")
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0)
 
-    for i, sid in enumerate(fully_ids):
-        if emb_cache.has(sid):
-            if (i + 1) % 20 == 0:
-                logger.info(f"  [{i+1}/{len(fully_ids)}] (cached)")
-            continue
+    # Convert margin from mm to voxels per axis
+    margin_vox = [int(np.ceil(margin_mm / s)) for s in spacing]
 
-        study = dataset.load_study(sid)
-        vol = normalize_ct(study.volume)
-        emb_cache.encode_and_cache(model, sid, vol, device)
-        logger.info(f"  [{i+1}/{len(fully_ids)}] {sid}: encoded")
+    slices = []
+    for dim in range(3):
+        lo = max(0, mins[dim] - margin_vox[dim])
+        hi = min(volume_shape[dim], maxs[dim] + margin_vox[dim] + 1)
+        slices.append(slice(lo, hi))
 
-    logger.info("Precomputation complete.")
+    return tuple(slices)
+
+
+def encode_crop(
+    model: EcoSegNet,
+    volume_crop: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    """Encode a cropped volume on GPU, return embeddings as GPU tensor.
+
+    Pads to multiples of 32 for the encoder, then crops back.
+    """
+    D, H, W = volume_crop.shape
+
+    vol_t = torch.tensor(volume_crop, dtype=torch.float32, device=device)
+    vol_t = vol_t.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+
+    # Pad to multiples of 32 (SwinUNETR requirement for patch embedding)
+    pad_d = (32 - D % 32) % 32
+    pad_h = (32 - H % 32) % 32
+    pad_w = (32 - W % 32) % 32
+    if pad_d > 0 or pad_h > 0 or pad_w > 0:
+        vol_t = F.pad(vol_t, (0, pad_w, 0, pad_h, 0, pad_d))
+
+    with torch.no_grad():
+        emb = model.encode_sliding_window(vol_t)
+
+    # Crop back to original size
+    emb = emb[:, :, :D, :H, :W]
+
+    return emb.squeeze(0)  # (C, D, H, W)
 
 
 def run_experiment(args):
-    """Run GrowCut comparison experiment."""
+    """Run GrowCut comparison experiment.
+
+    Loads and processes each scan one at a time — no bulk pre-loading.
+    Results appear as each scan completes.
+    """
     device = torch.device(args.device)
     rng = np.random.default_rng(42)
 
     cache_dir = Path(args.cache_dir)
     dataset = LNQDataset(Path(args.data_root), cache_dir=cache_dir)
     dataset.discover_studies()
-    emb_cache = EmbeddingCache(cache_dir, feature_dim=args.feature_dim)
 
+    # Get fully-annotated study IDs (don't load them all upfront)
     fully_ids = dataset.get_validation_ids(20) + dataset.get_test_ids(20)
-    available = [sid for sid in fully_ids if emb_cache.has(sid)]
-    logger.info(f"Running on {len(available)} studies with cached embeddings")
+    logger.info(f"Will process {len(fully_ids)} fully-annotated studies one at a time")
 
-    dataset.preload_studies(available)
+    # Build encoder
+    enc_config = EncoderConfig(feature_dim=args.feature_dim, pretrained=True)
+    model = EcoSegNet(enc_config).to(device)
 
     stroke_counts = [5, 10, 20, 50, 100, 200]
     methods = ["intensity", "embedding"]
@@ -90,31 +134,38 @@ def run_experiment(args):
 
     gc_config = GrowCutConfig(max_iterations=200, convergence_threshold=0.001)
 
-    # Collect a few cases for visualization
     viz_cases = []
 
-    for i, sid in enumerate(available):
+    for i, sid in enumerate(fully_ids):
         study = dataset.load_study(sid)
         if study.seg_mask is None:
             continue
 
-        gt = (study.seg_mask > 0).astype(np.uint8)
-        if gt.sum() == 0:
+        gt_full = (study.seg_mask > 0).astype(np.uint8)
+        if gt_full.sum() == 0:
             continue
 
-        vol = normalize_ct(study.volume)
+        vol_full = normalize_ct(study.volume)
 
-        # Load embeddings
-        emb_np = emb_cache.load(sid)
-        if emb_np is None:
-            continue
-        emb_t = torch.tensor(emb_np, dtype=torch.float32, device=device)
-        vol_t = torch.tensor(vol, dtype=torch.float32, device=device)
+        # Crop to ROI around lymph nodes (10cm margin)
+        roi = compute_roi(gt_full, study.spacing, margin_mm=100.0, volume_shape=vol_full.shape)
+        vol_crop = vol_full[roi]
+        gt_crop = gt_full[roi]
+
+        crop_shape = vol_crop.shape
+        logger.debug(
+            f"{sid}: full={vol_full.shape}, crop={crop_shape}, "
+            f"reduction={np.prod(crop_shape)/np.prod(vol_full.shape):.1%}"
+        )
+
+        # Compute embeddings on cropped region only
+        emb_crop = encode_crop(model, vol_crop, device)  # (C, D', H', W') on GPU
+        vol_crop_t = torch.tensor(vol_crop, dtype=torch.float32, device=device)
 
         for n_strokes in stroke_counts:
-            # Use same seeds for both methods (fair comparison)
+            # Simulate paint strokes on cropped GT
             seeds_np = simulate_paint_strokes(
-                gt,
+                gt_crop,
                 num_positive=n_strokes,
                 num_negative=n_strokes,
                 rng=np.random.default_rng(rng.integers(2**31) + n_strokes),
@@ -123,10 +174,10 @@ def run_experiment(args):
 
             # Traditional GrowCut (intensity)
             t0 = time.time()
-            labels_int, strength_int = growcut_intensity(vol_t, seeds_t, gc_config)
+            labels_int, strength_int = growcut_intensity(vol_crop_t, seeds_t, gc_config)
             time_int = time.time() - t0
             pred_int = (labels_int == 1).cpu().numpy().astype(np.uint8)
-            dice_int = dice_score(pred_int, gt)
+            dice_int = dice_score(pred_int, gt_crop)
 
             results["intensity"][n_strokes].append({
                 "study_id": sid, "dice": float(dice_int), "time_s": time_int,
@@ -134,10 +185,10 @@ def run_experiment(args):
 
             # Embedding GrowCut
             t0 = time.time()
-            labels_emb, strength_emb = growcut_embedding(emb_t, seeds_t, gc_config)
+            labels_emb, strength_emb = growcut_embedding(emb_crop, seeds_t, gc_config)
             time_emb = time.time() - t0
             pred_emb = (labels_emb == 1).cpu().numpy().astype(np.uint8)
-            dice_emb = dice_score(pred_emb, gt)
+            dice_emb = dice_score(pred_emb, gt_crop)
 
             results["embedding"][n_strokes].append({
                 "study_id": sid, "dice": float(dice_emb), "time_s": time_emb,
@@ -147,8 +198,8 @@ def run_experiment(args):
             if len(viz_cases) < 3 and n_strokes == 50:
                 viz_cases.append({
                     "study_id": sid,
-                    "volume": vol,
-                    "gt": gt,
+                    "volume": vol_crop,
+                    "gt": gt_crop,
                     "seeds": seeds_np,
                     "pred_intensity": pred_int,
                     "pred_embedding": pred_emb,
@@ -156,21 +207,22 @@ def run_experiment(args):
                     "strength_embedding": strength_emb.cpu().numpy(),
                     "dice_intensity": dice_int,
                     "dice_embedding": dice_emb,
-                    "spacing": study.spacing,
                 })
 
-        # Free GPU memory
-        del emb_t, vol_t
+        # Free GPU and CPU memory — don't accumulate all 120 studies
+        del emb_crop, vol_crop_t
+        if sid in dataset._studies:
+            del dataset._studies[sid]
         torch.cuda.empty_cache()
 
-        if (i + 1) % 5 == 0 or i + 1 == len(available):
+        if (i + 1) % 5 == 0 or i + 1 == len(fully_ids):
             parts = []
-            for n in stroke_counts:
+            for n in [10, 50, 200]:
                 if results["intensity"][n] and results["embedding"][n]:
                     di = np.mean([r["dice"] for r in results["intensity"][n]])
                     de = np.mean([r["dice"] for r in results["embedding"][n]])
                     parts.append(f"{n}pt: int={di:.3f} emb={de:.3f}")
-            logger.info(f"  [{i+1}/{len(available)}] " + ", ".join(parts))
+            logger.info(f"  [{i+1}/{len(fully_ids)}] " + ", ".join(parts))
 
     # Save results
     output_dir = cache_dir / "growcut_experiment"
@@ -225,7 +277,7 @@ def _generate_visualizations(viz_cases: list, output_dir: Path):
         strength_int = case["strength_intensity"]
         strength_emb = case["strength_embedding"]
 
-        # Find the slice with the most ground truth lymph node
+        # Find the slice with the most ground truth
         gt_per_slice = gt.sum(axis=(1, 2))
         best_slice = np.argmax(gt_per_slice)
 
@@ -233,40 +285,44 @@ def _generate_visualizations(viz_cases: list, output_dir: Path):
 
         # --- Row 1: Segmentation comparison ---
 
-        # CT with ground truth
+        # CT with ground truth + seeds
         axes[0, 0].imshow(vol[best_slice], cmap="gray")
         axes[0, 0].contour(gt[best_slice], levels=[0.5], colors="lime", linewidths=2)
-        # Show seed points
         pos_seeds = seeds[best_slice] == 1
         neg_seeds = seeds[best_slice] == 2
         if pos_seeds.any():
             ys, xs = np.where(pos_seeds)
-            axes[0, 0].scatter(xs, ys, c="red", s=15, zorder=5, edgecolors="white", linewidths=0.5)
+            axes[0, 0].scatter(xs, ys, c="red", s=15, zorder=5,
+                             edgecolors="white", linewidths=0.5)
         if neg_seeds.any():
             ys, xs = np.where(neg_seeds)
-            axes[0, 0].scatter(xs, ys, c="blue", s=15, zorder=5, edgecolors="white", linewidths=0.5)
+            axes[0, 0].scatter(xs, ys, c="blue", s=15, zorder=5,
+                             edgecolors="white", linewidths=0.5)
         axes[0, 0].set_title("CT + GT (green) + Seeds (red/blue)")
         axes[0, 0].axis("off")
 
-        # Intensity GrowCut result
+        # Intensity GrowCut
         axes[0, 1].imshow(vol[best_slice], cmap="gray")
-        axes[0, 1].contour(gt[best_slice], levels=[0.5], colors="lime", linewidths=1, linestyles="dashed")
+        axes[0, 1].contour(gt[best_slice], levels=[0.5], colors="lime",
+                          linewidths=1, linestyles="dashed")
         if pred_int[best_slice].any():
             axes[0, 1].contour(pred_int[best_slice], levels=[0.5], colors="red", linewidths=2)
         axes[0, 1].set_title(f"Intensity GrowCut\nDice={case['dice_intensity']:.3f}")
         axes[0, 1].axis("off")
 
-        # Embedding GrowCut result
+        # Embedding GrowCut
         axes[0, 2].imshow(vol[best_slice], cmap="gray")
-        axes[0, 2].contour(gt[best_slice], levels=[0.5], colors="lime", linewidths=1, linestyles="dashed")
+        axes[0, 2].contour(gt[best_slice], levels=[0.5], colors="lime",
+                          linewidths=1, linestyles="dashed")
         if pred_emb[best_slice].any():
             axes[0, 2].contour(pred_emb[best_slice], levels=[0.5], colors="cyan", linewidths=2)
         axes[0, 2].set_title(f"Embedding GrowCut\nDice={case['dice_embedding']:.3f}")
         axes[0, 2].axis("off")
 
-        # Side by side overlay
+        # Overlay
         axes[0, 3].imshow(vol[best_slice], cmap="gray")
-        axes[0, 3].contour(gt[best_slice], levels=[0.5], colors="lime", linewidths=1.5, linestyles="dashed")
+        axes[0, 3].contour(gt[best_slice], levels=[0.5], colors="lime",
+                          linewidths=1.5, linestyles="dashed")
         if pred_int[best_slice].any():
             axes[0, 3].contour(pred_int[best_slice], levels=[0.5], colors="red", linewidths=1.5)
         if pred_emb[best_slice].any():
@@ -274,10 +330,10 @@ def _generate_visualizations(viz_cases: list, output_dir: Path):
         axes[0, 3].set_title("Overlay\nGT=green, Int=red, Emb=cyan")
         axes[0, 3].axis("off")
 
-        # --- Row 2: Strength/confidence maps ---
+        # --- Row 2: Strength maps ---
 
         axes[1, 0].imshow(vol[best_slice], cmap="gray")
-        axes[1, 0].set_title("CT Volume")
+        axes[1, 0].set_title("CT Volume (cropped)")
         axes[1, 0].axis("off")
 
         im1 = axes[1, 1].imshow(strength_int[best_slice], cmap="hot", vmin=0, vmax=1)
@@ -290,15 +346,14 @@ def _generate_visualizations(viz_cases: list, output_dir: Path):
         axes[1, 2].axis("off")
         plt.colorbar(im2, ax=axes[1, 2], fraction=0.046)
 
-        # Strength difference
         diff = strength_emb[best_slice] - strength_int[best_slice]
         im3 = axes[1, 3].imshow(diff, cmap="RdBu_r", vmin=-0.5, vmax=0.5)
-        axes[1, 3].set_title("Emb - Int Strength")
+        axes[1, 3].set_title("Emb − Int Strength")
         axes[1, 3].axis("off")
         plt.colorbar(im3, ax=axes[1, 3], fraction=0.046)
 
         fig.suptitle(
-            f"{case['study_id']} — 50 strokes per class\n"
+            f"{case['study_id']} — 50 strokes per class (cropped ROI)\n"
             f"Intensity Dice: {case['dice_intensity']:.3f}, "
             f"Embedding Dice: {case['dice_embedding']:.3f}",
             fontsize=14, fontweight="bold",
@@ -316,19 +371,12 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="GrowCut on embeddings experiment")
-    subparsers = parser.add_subparsers(dest="command")
-
-    pre = subparsers.add_parser("precompute", help="Precompute embeddings")
-    pre.add_argument("--data-root", type=str, required=True)
-    pre.add_argument("--cache-dir", type=str, required=True)
-    pre.add_argument("--device", type=str, default="auto")
-    pre.add_argument("--feature-dim", type=int, default=16)
-
-    run = subparsers.add_parser("run", help="Run GrowCut experiment")
-    run.add_argument("--data-root", type=str, required=True)
-    run.add_argument("--cache-dir", type=str, required=True)
-    run.add_argument("--device", type=str, default="auto")
-    run.add_argument("--feature-dim", type=int, default=16)
+    parser.add_argument("command", choices=["run"],
+                       help="Run the GrowCut comparison experiment")
+    parser.add_argument("--data-root", type=str, required=True)
+    parser.add_argument("--cache-dir", type=str, required=True)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--feature-dim", type=int, default=16)
 
     args = parser.parse_args()
 
@@ -338,12 +386,7 @@ def main():
         else:
             args.device = "cpu"
 
-    if args.command == "precompute":
-        precompute_embeddings(args)
-    elif args.command == "run":
-        run_experiment(args)
-    else:
-        parser.print_help()
+    run_experiment(args)
 
 
 if __name__ == "__main__":

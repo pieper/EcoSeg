@@ -151,12 +151,20 @@ class EcoSegNet(nn.Module):
         return model.swinViT
 
     def _get_encoder_out_dim(self) -> int:
-        """Determine the encoder output channel count."""
-        # SwinUNETR with feature_size=48 produces features at multiple scales.
-        # The deepest features have 48 * 8 = 384 channels at 1/32 resolution.
-        # For dense per-voxel embeddings, we use the first-scale features (48 channels)
-        # which are at 1/2 resolution, then upsample.
-        return 48
+        """Determine the encoder output channel count.
+
+        SwinUNETR with feature_size=48 produces features at 5 scales:
+          Stage 0: 48 channels at 1/2 resolution  (local texture)
+          Stage 1: 96 channels at 1/4 resolution  (local structure)
+          Stage 2: 192 channels at 1/8 resolution (regional context)
+          Stage 3: 384 channels at 1/16 resolution (body region)
+          Stage 4: 768 channels at 1/32 resolution (global context)
+
+        We concatenate stages 0-3 upsampled to full resolution:
+          48 + 96 + 192 + 384 = 720 channels
+        (Skip stage 4 — too coarse for voxel-level discrimination)
+        """
+        return 48 + 96 + 192 + 384  # 720
 
     def _freeze_encoder(self):
         """Freeze all encoder parameters."""
@@ -176,8 +184,39 @@ class EcoSegNet(nn.Module):
         if name in self.species_heads:
             del self.species_heads[name]
 
+    def _multiscale_features(self, volume: torch.Tensor) -> torch.Tensor:
+        """Extract and concatenate multi-scale features from the encoder.
+
+        Upsamples features from stages 0-3 to full resolution and
+        concatenates them, giving each voxel a rich feature vector
+        with both local texture and broad anatomical context.
+
+        Args:
+            volume: (batch, 1, D, H, W)
+
+        Returns:
+            (batch, 720, D, H, W) concatenated multi-scale features
+        """
+        target_size = volume.shape[2:]
+        features = self.encoder(volume)  # List of 5 feature maps
+
+        # Upsample stages 0-3 to full resolution and concatenate
+        upsampled = []
+        for stage_idx in range(4):  # Skip stage 4 (too coarse)
+            feat = features[stage_idx]
+            if feat.shape[2:] != target_size:
+                feat = nn.functional.interpolate(
+                    feat, size=target_size, mode='trilinear', align_corners=False
+                )
+            upsampled.append(feat)
+
+        return torch.cat(upsampled, dim=1)  # (batch, 720, D, H, W)
+
     def encode(self, volume: torch.Tensor) -> torch.Tensor:
         """Compute dense embeddings for a volume.
+
+        Uses multi-scale features (stages 0-3 concatenated) projected
+        to a lower-dimensional embedding space.
 
         Args:
             volume: (batch, 1, D, H, W) normalized CT volume
@@ -186,22 +225,9 @@ class EcoSegNet(nn.Module):
             embeddings: (batch, feature_dim, D, H, W) projected features
         """
         with torch.no_grad():
-            # SwinViT returns features at multiple scales
-            # hidden_states_out is a list of feature maps at different resolutions
-            features = self.encoder(volume)
+            feat = self._multiscale_features(volume)
 
-            # Use the first scale features (48 channels, 1/2 resolution)
-            # and upsample to full resolution
-            feat = features[0]  # (batch, 48, D/2, H/2, W/2)
-
-            # Upsample to match input resolution
-            feat = nn.functional.interpolate(
-                feat, size=volume.shape[2:], mode='trilinear', align_corners=False
-            )
-
-        # Project to lower-dimensional embedding space (projector IS trainable)
         embeddings = self.projector(feat)
-
         return embeddings
 
     def encode_sliding_window(
@@ -212,8 +238,8 @@ class EcoSegNet(nn.Module):
     ) -> torch.Tensor:
         """Encode a full-size volume using sliding window inference.
 
-        Handles volumes larger than the encoder's trained patch size by
-        processing overlapping patches and averaging embeddings.
+        Uses multi-scale features from the encoder, projected to the
+        embedding space. Handles volumes larger than the patch size.
 
         Args:
             volume: (1, 1, D, H, W) normalized CT volume
@@ -227,19 +253,14 @@ class EcoSegNet(nn.Module):
 
         inferer = SlidingWindowInferer(
             roi_size=patch_size,
-            sw_batch_size=4,
+            sw_batch_size=2,  # Reduced — multi-scale uses more VRAM
             overlap=overlap,
             mode='gaussian',
         )
 
         with torch.no_grad():
-            # Use the encoder + projector as the network for sliding window
             def _encode_patch(x):
-                features = self.encoder(x)
-                feat = features[0]
-                feat = nn.functional.interpolate(
-                    feat, size=x.shape[2:], mode='trilinear', align_corners=False
-                )
+                feat = self._multiscale_features(x)
                 return self.projector(feat)
 
             embeddings = inferer(volume, _encode_patch)
