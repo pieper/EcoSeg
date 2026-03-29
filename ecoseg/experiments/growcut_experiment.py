@@ -29,7 +29,8 @@ from typing import Optional
 from ecoseg.data.dicom_loader import LNQDataset
 from ecoseg.models.ecosegnet import EcoSegNet, EncoderConfig
 from ecoseg.models.growcut_embedding import (
-    growcut_embedding, growcut_intensity, growcut_learned_per_species,
+    growcut_embedding, growcut_intensity,
+    growcut_learned_fitness_per_species,
     simulate_paint_strokes, GrowCutConfig,
 )
 from ecoseg.models.trainer import normalize_ct
@@ -286,10 +287,11 @@ def run_experiment(args):
             })
             logger.info(f"    {' ':3s}          embedding: {dice_emb:.3f} ({time_emb:.1f}s)")
 
-            # Learned GrowCut (species classifiers trained on seed embeddings)
+            # Learned GrowCut (CNN trained on raw patches at seed locations)
             t0 = time.time()
-            labels_lrn, strength_lrn = growcut_learned_per_species(
-                emb_crop, seeds_t, gc_config, num_classifier_epochs=50,
+            labels_lrn, strength_lrn = growcut_learned_fitness_per_species(
+                vol_crop_t, seeds_t, gc_config,
+                patch_size=16, stride=4, num_epochs=100,
             )
             time_lrn = time.time() - t0
             pred_lrn = (labels_lrn == 1).cpu().numpy().astype(np.uint8)

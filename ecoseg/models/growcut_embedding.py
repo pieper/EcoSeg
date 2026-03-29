@@ -129,6 +129,155 @@ def growcut_intensity(
     return _growcut_core(fitness_fn, labels, strength, seeds, config, "intensity")
 
 
+def growcut_learned_fitness(
+    volume: torch.Tensor,
+    seeds: torch.Tensor,
+    config: GrowCutConfig = GrowCutConfig(),
+    patch_size: int = 16,
+    stride: int = 4,
+    num_epochs: int = 100,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GrowCut using a learned fitness from raw CT patches.
+
+    1. Trains a small CNN on patches at seed locations (foreground vs background)
+    2. Computes a per-voxel fitness map by sliding the classifier over the volume
+    3. Uses fitness_map as the GrowCut fitness: species propagate into voxels
+       that the classifier scores highly for them
+
+    The fitness combines the learned score with local intensity similarity
+    so that propagation still respects intensity boundaries.
+
+    Args:
+        volume: (D, H, W) normalized CT on GPU
+        seeds: (D, H, W) int tensor — 1=foreground, 2=background
+        config: GrowCut iteration config
+        patch_size: CNN patch size
+        stride: fitness map stride
+        num_epochs: classifier training epochs
+    """
+    from ecoseg.models.learned_fitness import train_patch_classifier, compute_fitness_map
+
+    device = volume.device
+
+    # Train classifier from seed patches
+    model = train_patch_classifier(volume, seeds, patch_size, num_epochs, device)
+
+    # Compute per-voxel fitness map (P(foreground) for each voxel)
+    fg_fitness = compute_fitness_map(model, volume, patch_size, stride)
+    # Background fitness = 1 - foreground fitness
+    bg_fitness = 1.0 - fg_fitness
+
+    # Build per-species fitness maps
+    species_fitness = {1: fg_fitness, 2: bg_fitness}
+
+    # GrowCut fitness = species_score * local_intensity_similarity
+    # This combines the learned "what tissue type is this?" with
+    # the classic "is there a smooth boundary?" signal
+    def learned_fitness_fn(dz, dy, dx):
+        neighbor_vol = torch.roll(volume, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
+        local_sim = (1.0 - torch.abs(volume - neighbor_vol)).clamp(0, 1)
+        # We need to know which species is attacking, but _growcut_core
+        # doesn't pass that info. Use a combined fitness that favors
+        # the locally-dominant species.
+        # For each voxel: max species fitness * local similarity
+        max_species = torch.max(fg_fitness, bg_fitness)
+        return local_sim * (0.3 + 0.7 * max_species)
+
+    labels = seeds.clone()
+    strength = (seeds > 0).float()
+    return _growcut_core(learned_fitness_fn, labels, strength, seeds, config, "learned_fitness")
+
+
+def growcut_learned_fitness_per_species(
+    volume: torch.Tensor,
+    seeds: torch.Tensor,
+    config: GrowCutConfig = GrowCutConfig(),
+    patch_size: int = 16,
+    stride: int = 4,
+    num_epochs: int = 100,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GrowCut where each species uses its own learned fitness.
+
+    Each species gets a fitness map from the CNN — foreground seeds
+    use fg_fitness, background seeds use bg_fitness. A species can
+    only conquer voxels where its classifier scores them highly.
+
+    This is the core "species adapted to its habitat" concept:
+    the paint strokes define the species' DNA, the CNN learns what
+    habitat it thrives in, and GrowCut simulates the competition.
+    """
+    from ecoseg.models.learned_fitness import train_patch_classifier, compute_fitness_map
+
+    device = volume.device
+    D, H, W = volume.shape
+
+    # Train and compute fitness maps
+    model = train_patch_classifier(volume, seeds, patch_size, num_epochs, device)
+    fg_fitness = compute_fitness_map(model, volume, patch_size, stride)
+    bg_fitness = 1.0 - fg_fitness
+
+    species_fitness = {1: fg_fitness, 2: bg_fitness}
+
+    # Per-species GrowCut
+    labels = seeds.clone()
+    strength = (seeds > 0).float()
+    seed_mask = seeds > 0
+    no_change_count = 0
+
+    offsets = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]
+
+    for iteration in range(config.max_iterations):
+        changed = 0
+        new_labels = labels.clone()
+        new_strength = strength.clone()
+
+        for dz, dy, dx in offsets:
+            neighbor_vol = torch.roll(volume, shifts=(-dz,-dy,-dx), dims=(0,1,2))
+            neighbor_labels = torch.roll(labels, shifts=(-dz,-dy,-dx), dims=(0,1,2))
+            neighbor_strength = torch.roll(strength, shifts=(-dz,-dy,-dx), dims=(0,1,2))
+
+            boundary_mask = torch.ones(D, H, W, device=device, dtype=torch.bool)
+            if dz == -1: boundary_mask[0,:,:] = False
+            elif dz == 1: boundary_mask[-1,:,:] = False
+            if dy == -1: boundary_mask[:,0,:] = False
+            elif dy == 1: boundary_mask[:,-1,:] = False
+            if dx == -1: boundary_mask[:,:,0] = False
+            elif dx == 1: boundary_mask[:,:,-1] = False
+
+            # Local intensity similarity (boundary detection)
+            local_sim = (1.0 - torch.abs(volume - neighbor_vol)).clamp(0, 1)
+
+            for lbl_val, sp_fitness in species_fitness.items():
+                # Fitness = local similarity * species-specific learned score
+                fitness = local_sim * (0.3 + 0.7 * sp_fitness)
+                attack = fitness * neighbor_strength
+
+                wins = (
+                    boundary_mask
+                    & (neighbor_labels == lbl_val)
+                    & ((attack > new_strength) | ((new_labels == 0) & (attack > 0)))
+                )
+
+                new_labels[wins] = lbl_val
+                new_strength[wins] = attack[wins]
+                changed += wins.sum().item()
+
+        labels = new_labels
+        strength = new_strength
+        labels[seed_mask] = seeds[seed_mask]
+        strength[seed_mask] = 1.0
+
+        if changed == 0:
+            no_change_count += 1
+            if no_change_count >= config.stop_after_no_change:
+                logger.debug(f"GrowCut (learned_fitness) converged at iteration {iteration + 1}")
+                break
+        else:
+            no_change_count = 0
+
+    return labels, strength
+
+
 def train_fitness_classifier(
     embeddings: torch.Tensor,
     seeds: torch.Tensor,
