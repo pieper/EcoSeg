@@ -162,13 +162,19 @@ def growcut_embedding(
         total_voxels = D * H * W
         change_fraction = changed / total_voxels
         if change_fraction < config.convergence_threshold:
-            logger.debug(f"GrowCut (embedding) converged at iteration {iteration + 1} "
-                         f"({changed} voxels changed)")
+            n_labeled = (labels > 0).sum().item()
+            logger.info(
+                f"GrowCut (embedding) converged at iteration {iteration + 1}, "
+                f"labeled={n_labeled}/{total_voxels}"
+            )
             break
 
-        if (iteration + 1) % 50 == 0:
-            logger.debug(f"GrowCut (embedding) iteration {iteration + 1}: "
-                         f"{changed} voxels changed ({change_fraction:.4f})")
+        if (iteration + 1) % 100 == 0:
+            n_labeled = (labels > 0).sum().item()
+            logger.info(
+                f"GrowCut (embedding) iter {iteration+1}: "
+                f"changed={changed}, labeled={n_labeled}/{total_voxels}"
+            )
 
     return labels, strength
 
@@ -250,8 +256,19 @@ def growcut_intensity(
         total_voxels = D * H * W
         change_fraction = changed / total_voxels
         if change_fraction < config.convergence_threshold:
-            logger.debug(f"GrowCut (intensity) converged at iteration {iteration + 1}")
+            n_labeled = (labels > 0).sum().item()
+            logger.info(
+                f"GrowCut (intensity) converged at iteration {iteration + 1}, "
+                f"labeled={n_labeled}/{total_voxels}"
+            )
             break
+
+        if (iteration + 1) % 100 == 0:
+            n_labeled = (labels > 0).sum().item()
+            logger.info(
+                f"GrowCut (intensity) iter {iteration+1}: "
+                f"changed={changed}, labeled={n_labeled}/{total_voxels}"
+            )
 
     return labels, strength
 
