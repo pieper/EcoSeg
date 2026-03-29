@@ -192,6 +192,24 @@ def run_experiment(args):
 
     viz_cases = []
 
+    # Cache for PCA-reduced embeddings
+    emb_cache_dir = cache_dir / "pca_embeddings"
+    emb_cache_dir.mkdir(exist_ok=True)
+
+    def get_embeddings(sid, vol_crop):
+        """Get PCA'd embeddings from cache or compute them."""
+        cache_path = emb_cache_dir / f"{sid}.pt"
+        if cache_path.exists():
+            return torch.load(cache_path, map_location=device, weights_only=True)
+        emb = encode_crop(model, vol_crop, device)
+        # Cache for next run
+        torch.save(emb.cpu(), cache_path)
+        return emb
+
+    # Pre-compute embeddings for first scan while we set up
+    pending_emb = None
+    pending_data = None
+
     for i, sid in enumerate(fully_ids):
         study = dataset.load_study(sid)
         if study.seg_mask is None:
@@ -208,15 +226,13 @@ def run_experiment(args):
         vol_crop = vol_full[roi]
         gt_crop = gt_full[roi]
 
-        crop_shape = vol_crop.shape
-        logger.debug(
-            f"{sid}: full={vol_full.shape}, crop={crop_shape}, "
-            f"reduction={np.prod(crop_shape)/np.prod(vol_full.shape):.1%}"
-        )
-
-        # Compute embeddings on cropped region only
-        emb_crop = encode_crop(model, vol_crop, device)  # (C, D', H', W') on GPU
+        # Get embeddings (cached or computed)
+        emb_crop = get_embeddings(sid, vol_crop)  # (C, D', H', W') on GPU
         vol_crop_t = torch.tensor(vol_crop, dtype=torch.float32, device=device)
+
+        # Free the study data — we have what we need
+        if sid in dataset._studies:
+            del dataset._studies[sid]
 
         for n_strokes in stroke_counts:
             # Simulate paint strokes on cropped GT
@@ -243,6 +259,22 @@ def run_experiment(args):
             t0 = time.time()
             labels_emb, strength_emb = growcut_embedding(emb_crop, seeds_t, gc_config)
             time_emb = time.time() - t0
+
+            # Diagnostic: log prototype discrimination (first scan, 50 strokes only)
+            if i == 0 and n_strokes == 50:
+                emb_norm = F.normalize(emb_crop, dim=0)
+                gt_crop_t = torch.tensor(gt_crop, device=device)
+                for lbl in [1, 2]:
+                    mask = seeds_t == lbl
+                    if mask.sum() > 0:
+                        seed_embs = emb_norm[:, mask]
+                        proto = F.normalize(seed_embs.mean(dim=1), dim=0)
+                        aff = (proto.view(-1,1,1,1) * emb_norm).sum(dim=0)
+                        fg_aff = aff[gt_crop_t == 1].mean().item()
+                        bg_aff = aff[gt_crop_t == 0].mean().item()
+                        logger.info(f"  Prototype {lbl}: FG_affinity={fg_aff:.3f}, BG_affinity={bg_aff:.3f}")
+                logger.info(f"  Int unlabeled: {(labels_int==0).sum().item()}, Emb unlabeled: {(labels_emb==0).sum().item()}")
+                logger.info(f"  Predictions identical: {torch.equal(labels_int, labels_emb)}")
             pred_emb = (labels_emb == 1).cpu().numpy().astype(np.uint8)
             dice_emb = dice_score(pred_emb, gt_crop)
 
