@@ -188,7 +188,7 @@ def run_experiment(args):
     methods = ["intensity", "embedding"]
     results = {m: {n: [] for n in stroke_counts} for m in methods}
 
-    gc_config = GrowCutConfig(max_iterations=200, convergence_threshold=0.001)
+    gc_config = GrowCutConfig(max_iterations=1000, convergence_threshold=0.0)
 
     viz_cases = []
 
