@@ -35,23 +35,33 @@ def growcut_embedding(
     config: GrowCutConfig = GrowCutConfig(),
     fitness_fn: Optional[callable] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run GrowCut using embedding similarity for propagation.
+    """GrowCut using embedding similarity, preserving per-seed competition.
 
-    Each voxel has a label (0 = unlabeled, 1..N = species) and a strength
-    (0-1, how confident the assignment is). Seeds start at strength 1.0.
+    Stays true to the GrowCut algorithm: each individual seed voxel
+    competes independently, and the winner at each voxel is the seed
+    with the strongest path through similar tissue. Different seeds
+    from the same class compete — the one with the best path wins,
+    providing natural variability in the "DNA" that conquers each region.
 
-    At each iteration, for each voxel, check all 6-connected neighbors.
-    If a neighbor's label could "attack" this voxel:
-      - Compute fitness = similarity between neighbor's embedding and this voxel's embedding
-      - If fitness * neighbor_strength > this_voxel_strength, the neighbor wins
-      - This voxel gets the neighbor's label with strength = fitness * neighbor_strength
+    Fitness at each step combines two factors:
+      - Local similarity: cosine similarity between the attacking neighbor's
+        embedding and the target voxel's embedding (boundary detection —
+        propagation attenuates at tissue boundaries)
+      - Prototype affinity: cosine similarity between the target voxel's
+        embedding and the attacking species' prototype (species selectivity —
+        prevents propagation into wrong tissue types)
+
+    fitness = local_similarity * prototype_affinity
+
+    This means: a label propagates easily through homogeneous tissue
+    that matches the species prototype, but stops at boundaries (low
+    local similarity) AND stops in wrong tissue (low prototype affinity).
 
     Args:
         embeddings: (C, D, H, W) per-voxel embedding vectors (on GPU)
-        seeds: (D, H, W) int tensor — 0 = unlabeled, 1+ = species label (on GPU)
+        seeds: (D, H, W) int tensor — 0 = unlabeled, 1+ = species label
         config: iteration parameters
-        fitness_fn: optional learned fitness function. If None, uses cosine similarity.
-                    Signature: fitness_fn(emb_center, emb_neighbor) -> similarity (0-1)
+        fitness_fn: optional override fitness function
 
     Returns:
         labels: (D, H, W) int tensor — final species assignment
@@ -63,9 +73,30 @@ def growcut_embedding(
     # Normalize embeddings for cosine similarity
     emb_norm = F.normalize(embeddings, dim=0)  # (C, D, H, W)
 
+    # Compute species prototypes (mean embedding of each species' seeds)
+    unique_labels = seeds.unique()
+    unique_labels = unique_labels[unique_labels > 0]
+
+    prototypes = {}
+    for lbl in unique_labels:
+        lbl_val = lbl.item()
+        mask = (seeds == lbl_val)
+        seed_embs = emb_norm[:, mask]  # (C, num_seeds)
+        proto = seed_embs.mean(dim=1)  # (C,)
+        prototypes[lbl_val] = F.normalize(proto, dim=0)
+
+    # Pre-compute prototype affinity for each species at every voxel
+    # This is the "does this voxel match this species?" component
+    proto_affinity = {}
+    for lbl_val, proto in prototypes.items():
+        sim = (proto.view(C, 1, 1, 1) * emb_norm).sum(dim=0)  # (D, H, W)
+        proto_affinity[lbl_val] = sim.clamp(0, 1)
+
     # Initialize labels and strength from seeds
-    labels = seeds.clone()  # (D, H, W)
-    strength = (seeds > 0).float()  # Seeds have strength 1.0
+    labels = seeds.clone()
+    strength = torch.zeros(D, H, W, device=device)
+    seed_mask = seeds > 0
+    strength[seed_mask] = 1.0
 
     # 6-connected neighbor offsets
     offsets = [
@@ -80,70 +111,58 @@ def growcut_embedding(
         new_strength = strength.clone()
 
         for dz, dy, dx in offsets:
-            # Shift embeddings, labels, and strength to represent this neighbor
-            # Using roll + masking at boundaries
+            # Shifted neighbor data
             neighbor_emb = torch.roll(emb_norm, shifts=(-dz, -dy, -dx), dims=(1, 2, 3))
             neighbor_labels = torch.roll(labels, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
             neighbor_strength = torch.roll(strength, shifts=(-dz, -dy, -dx), dims=(0, 1, 2))
 
-            # Mask out boundary wrapping artifacts
+            # Boundary mask
             boundary_mask = torch.ones(D, H, W, device=device, dtype=torch.bool)
-            if dz == -1:
-                boundary_mask[-1, :, :] = False
-            elif dz == 1:
-                boundary_mask[0, :, :] = False
-            if dy == -1:
-                boundary_mask[:, -1, :] = False
-            elif dy == 1:
-                boundary_mask[:, 0, :] = False
-            if dx == -1:
-                boundary_mask[:, :, -1] = False
-            elif dx == 1:
-                boundary_mask[:, :, 0] = False
+            if dz == -1: boundary_mask[-1, :, :] = False
+            elif dz == 1: boundary_mask[0, :, :] = False
+            if dy == -1: boundary_mask[:, -1, :] = False
+            elif dy == 1: boundary_mask[:, 0, :] = False
+            if dx == -1: boundary_mask[:, :, -1] = False
+            elif dx == 1: boundary_mask[:, :, 0] = False
 
-            # Compute fitness: cosine similarity between center and neighbor
-            if fitness_fn is not None:
-                fitness = fitness_fn(emb_norm, neighbor_emb)
-            else:
-                # Cosine similarity (embeddings already normalized)
-                fitness = (emb_norm * neighbor_emb).sum(dim=0)  # (D, H, W)
-                fitness = fitness.clamp(0, 1)  # Only positive similarity propagates
+            # Local similarity: how similar is the center voxel to the
+            # attacking neighbor? (boundary detection, just like classic GrowCut)
+            local_sim = (emb_norm * neighbor_emb).sum(dim=0).clamp(0, 1)  # (D, H, W)
 
-            # Attack strength = fitness * neighbor's strength
-            attack = fitness * neighbor_strength
+            for lbl_val in prototypes:
+                # Combined fitness = local boundary preservation × species affinity
+                fitness = local_sim * proto_affinity[lbl_val]
 
-            # Neighbor wins if it has a label, attack > current strength,
-            # and we're not at a boundary
-            wins = (
-                boundary_mask
-                & (neighbor_labels > 0)
-                & (attack > new_strength)
-            )
+                # Attack strength = fitness × neighbor's accumulated strength
+                # This preserves the classic GrowCut strength decay along paths
+                attack = fitness * neighbor_strength
 
-            # Update labels and strength where neighbor wins
-            new_labels[wins] = neighbor_labels[wins]
-            new_strength[wins] = attack[wins]
+                can_attack = (
+                    boundary_mask
+                    & (neighbor_labels == lbl_val)
+                    & (attack > new_strength)
+                )
 
-            changed += wins.sum().item()
+                new_labels[can_attack] = lbl_val
+                new_strength[can_attack] = attack[can_attack]
+                changed += can_attack.sum().item()
 
         labels = new_labels
         strength = new_strength
 
         # Preserve original seeds (never overwrite user input)
-        seed_mask = seeds > 0
         labels[seed_mask] = seeds[seed_mask]
         strength[seed_mask] = 1.0
 
-        # Check convergence
         total_voxels = D * H * W
         change_fraction = changed / total_voxels
         if change_fraction < config.convergence_threshold:
-            logger.debug(f"GrowCut converged at iteration {iteration + 1} "
-                         f"({changed} voxels changed, {change_fraction:.4f})")
+            logger.debug(f"GrowCut (embedding) converged at iteration {iteration + 1} "
+                         f"({changed} voxels changed)")
             break
 
         if (iteration + 1) % 50 == 0:
-            logger.debug(f"GrowCut iteration {iteration + 1}: "
+            logger.debug(f"GrowCut (embedding) iteration {iteration + 1}: "
                          f"{changed} voxels changed ({change_fraction:.4f})")
 
     return labels, strength
