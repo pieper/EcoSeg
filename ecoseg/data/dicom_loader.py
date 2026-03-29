@@ -177,10 +177,11 @@ def load_seg_mask(
     return mask.astype(np.uint8), annotation_type
 
 
-def _load_study_worker(info: dict, study_id: str) -> StudyData:
-    """Standalone function for loading a study in a worker process.
+def _load_and_cache_worker(info: dict, study_id: str, cache_path: Optional[str]) -> str:
+    """Load a study from DICOM and write .npz cache to disk.
 
-    Must be a top-level function (not a method) for ProcessPoolExecutor.
+    Returns the study_id on success. The main process then reads the
+    .npz from local disk, avoiding pickling large arrays through pipes.
     """
     volume, spacing, ct_datasets = load_ct_volume(info["ct_dir"])
 
@@ -193,15 +194,20 @@ def _load_study_worker(info: dict, study_id: str) -> StudyData:
             ct_datasets=ct_datasets,
         )
 
-    return StudyData(
-        study_id=study_id,
-        patient_id=info["patient_id"],
-        volume=volume,
-        spacing=spacing,
-        seg_mask=seg_mask,
-        annotation_type=annotation_type,
-        ct_series_uid=str(getattr(ct_datasets[0], "SeriesInstanceUID", "")),
-    )
+    ct_series_uid = str(getattr(ct_datasets[0], "SeriesInstanceUID", ""))
+
+    if cache_path is not None:
+        out = Path(cache_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            out,
+            volume=volume,
+            seg_mask=seg_mask if seg_mask is not None else np.array([]),
+            spacing=np.array(spacing),
+            meta=np.array([study_id, info["patient_id"], annotation_type, ct_series_uid]),
+        )
+
+    return study_id
 
 
 class LNQDataset:
@@ -369,25 +375,26 @@ class LNQDataset:
     def preload_studies(self, study_ids: list[str], num_workers: int = -1) -> None:
         """Pre-load multiple studies into memory.
 
-        Tries local disk cache first (fast). Falls back to loading from
-        DICOM source in parallel (slow, but results are cached for next time).
+        Phase 1: Load from local .npz cache (fast, local disk reads).
+        Phase 2: For cache misses, spawn worker processes that read DICOM
+                 and write .npz files directly to disk (no pickle through
+                 pipes). Then read the .npz files from local disk.
 
         Args:
             study_ids: list of study IDs to pre-load
-            num_workers: number of parallel worker processes for DICOM loading
+            num_workers: number of parallel worker processes (-1 = auto)
         """
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         if self._index is None:
             self.discover_studies()
 
-        # Filter out already-loaded studies
         to_load = [sid for sid in study_ids if sid not in self._studies]
         if not to_load:
             logger.info("All requested studies already in memory")
             return
 
-        # Phase 1: load from local cache (fast, single-threaded is fine for .npz)
+        # Phase 1: load from local cache
         cache_hits = 0
         still_need = []
         for sid in to_load:
@@ -404,29 +411,46 @@ class LNQDataset:
         if not still_need:
             return
 
-        # Phase 2: load from DICOM source in parallel
+        # Phase 2: workers write .npz to disk, main process reads them back
         if num_workers < 0:
             from ecoseg import available_workers
             num_workers = available_workers()
-        logger.info(f"Loading {len(still_need)} studies from DICOM using {num_workers} workers...")
+
+        if self.cache_dir is None:
+            # Need a cache dir for the worker strategy to work
+            self.cache_dir = Path.home() / ".ecoseg" / "cache"
+
+        logger.info(
+            f"Loading {len(still_need)} studies from DICOM using "
+            f"{num_workers} workers (cache: {self.cache_dir})"
+        )
 
         loaded = 0
         failed = 0
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             future_to_sid = {
-                executor.submit(_load_study_worker, self._index[sid], sid): sid
+                executor.submit(
+                    _load_and_cache_worker,
+                    self._index[sid],
+                    sid,
+                    str(self._cache_path(sid)),
+                ): sid
                 for sid in still_need
             }
 
             for future in as_completed(future_to_sid):
                 sid = future_to_sid[future]
                 try:
-                    study = future.result()
-                    self._studies[sid] = study
-                    # Save to cache for next time
-                    self._save_to_cache(study)
-                    loaded += 1
+                    future.result()  # Just the study_id string, not data
+                    # Read back from local cache — fast local disk read
+                    study = self._load_from_cache(sid)
+                    if study is not None:
+                        self._studies[sid] = study
+                        loaded += 1
+                    else:
+                        logger.warning(f"  Cache file missing after write for {sid}")
+                        failed += 1
                     if loaded % 20 == 0 or loaded == len(still_need):
                         logger.info(f"  Loaded {loaded}/{len(still_need)} from DICOM")
                 except Exception as e:

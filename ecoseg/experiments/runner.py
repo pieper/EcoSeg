@@ -120,15 +120,17 @@ class ExperimentRunner:
         logger.info(f"Experiment '{config.name}' using device: {self.device}")
 
     def setup(self) -> None:
-        """Initialize dataset, pre-load all studies, and create species."""
-        # Load dataset
+        """Initialize dataset and create species.
+
+        Only loads the studies needed for the first generation (validation +
+        test). Remaining studies are pre-loaded in a background thread so
+        training can start immediately.
+        """
+        import threading
+
         cache_path = Path(self.config.cache_dir) if self.config.cache_dir else None
         self.dataset = LNQDataset(Path(self.config.data_root), cache_dir=cache_path)
         self.dataset.discover_studies()
-
-        # Pre-load ALL studies in parallel using all available cores
-        all_ids = list(self.dataset._index.keys())
-        self.dataset.preload_studies(all_ids)
 
         # Create species
         for name in self.config.species_names:
@@ -138,6 +140,36 @@ class ExperimentRunner:
             f"Created {len(self.registry.species)} species: "
             f"{self.registry.species_names}"
         )
+
+        # Load only the studies needed for generation 0
+        validation_ids = self.dataset.get_validation_ids(self.config.num_validation)
+        test_ids = self.dataset.get_test_ids(self.config.num_validation)
+        gen0_ids = validation_ids + test_ids
+        logger.info(f"Loading {len(gen0_ids)} studies for generation 0...")
+        self.dataset.preload_studies(gen0_ids)
+
+        # Pre-load everything else in a background thread
+        all_ids = list(self.dataset._index.keys())
+        remaining = [sid for sid in all_ids if sid not in self.dataset._studies]
+        if remaining:
+            logger.info(f"Background loading {len(remaining)} remaining studies...")
+            self._bg_loader = threading.Thread(
+                target=self.dataset.preload_studies,
+                args=(remaining,),
+                daemon=True,
+            )
+            self._bg_loader.start()
+        else:
+            self._bg_loader = None
+
+    def _wait_for_background_load(self) -> None:
+        """Wait for background pre-loading to finish, if still running."""
+        if hasattr(self, '_bg_loader') and self._bg_loader is not None:
+            if self._bg_loader.is_alive():
+                logger.info("Waiting for background data loading to complete...")
+                self._bg_loader.join()
+                logger.info("Background loading complete.")
+            self._bg_loader = None
 
     def train_on_studies(
         self,
@@ -360,6 +392,9 @@ class ExperimentRunner:
         self.run_generation(
             self._fully_annotated_ids, [], test_ids,
         )
+
+        # Ensure background loading is done before we need partial scans
+        self._wait_for_background_load()
 
         # Get partially annotated study IDs
         all_ids = set(self.dataset._index.keys())

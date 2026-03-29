@@ -36,8 +36,9 @@ def main():
     run_parser.add_argument("--architecture", type=str, default="cnn3",
                             choices=["cnn3", "resnet"],
                             help="Species model architecture")
-    run_parser.add_argument("--cache-dir", type=str, default=None,
-                            help="Local directory to cache loaded studies as .npz")
+    run_parser.add_argument("--cache-dir", type=str,
+                            default=str(Path.home() / ".ecoseg" / "cache"),
+                            help="Local directory to cache loaded studies as .npz (default: ~/.ecoseg/cache)")
 
     args = parser.parse_args()
 
