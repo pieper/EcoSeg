@@ -82,10 +82,16 @@ def encode_crop(
     volume_crop: np.ndarray,
     device: torch.device,
 ) -> torch.Tensor:
-    """Encode a cropped volume on GPU, return embeddings as GPU tensor.
+    """Encode a cropped volume on GPU using raw multi-scale features.
+
+    Returns the full 720-dim features (not projected) to preserve
+    maximum discrimination. The projector is untrained and would
+    destroy the feature quality.
 
     Pads to multiples of 32 for the encoder, then crops back.
     """
+    from monai.inferers import SlidingWindowInferer
+
     D, H, W = volume_crop.shape
 
     vol_t = torch.tensor(volume_crop, dtype=torch.float32, device=device)
@@ -98,13 +104,24 @@ def encode_crop(
     if pad_d > 0 or pad_h > 0 or pad_w > 0:
         vol_t = F.pad(vol_t, (0, pad_w, 0, pad_h, 0, pad_d))
 
+    inferer = SlidingWindowInferer(
+        roi_size=(96, 96, 96),
+        sw_batch_size=2,
+        overlap=0.25,
+        mode='gaussian',
+    )
+
     with torch.no_grad():
-        emb = model.encode_sliding_window(vol_t)
+        # Use raw multi-scale features — skip the untrained projector
+        def _encode_patch(x):
+            return model._multiscale_features(x)
+
+        emb = inferer(vol_t, _encode_patch)
 
     # Crop back to original size
     emb = emb[:, :, :D, :H, :W]
 
-    return emb.squeeze(0)  # (C, D, H, W)
+    return emb.squeeze(0)  # (720, D, H, W)
 
 
 def run_experiment(args):
