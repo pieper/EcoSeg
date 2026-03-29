@@ -178,10 +178,10 @@ def load_seg_mask(
 
 
 def _load_and_cache_worker(info: dict, study_id: str, cache_path: Optional[str]) -> str:
-    """Load a study from DICOM and write .npz cache to disk.
+    """Load a study from DICOM and write zarr cache to disk.
 
     Returns the study_id on success. The main process then reads the
-    .npz from local disk, avoiding pickling large arrays through pipes.
+    zarr from local disk, avoiding pickling large arrays through pipes.
     """
     volume, spacing, ct_datasets = load_ct_volume(info["ct_dir"])
 
@@ -197,15 +197,31 @@ def _load_and_cache_worker(info: dict, study_id: str, cache_path: Optional[str])
     ct_series_uid = str(getattr(ct_datasets[0], "SeriesInstanceUID", ""))
 
     if cache_path is not None:
+        import zarr
+        from numcodecs import Blosc
+
         out = Path(cache_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            out,
-            volume=volume,
-            seg_mask=seg_mask if seg_mask is not None else np.array([]),
-            spacing=np.array(spacing),
-            meta=np.array([study_id, info["patient_id"], annotation_type, ct_series_uid]),
-        )
+        compressor = Blosc(cname='lz4', clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+        store = zarr.DirectoryStore(str(out))
+        root = zarr.group(store, overwrite=True)
+
+        root.array('volume', volume, compressor=compressor,
+                   chunks=(min(64, volume.shape[0]),
+                           min(128, volume.shape[1]),
+                           min(128, volume.shape[2])))
+        if seg_mask is not None:
+            root.array('seg_mask', seg_mask, compressor=compressor,
+                       chunks=(min(64, seg_mask.shape[0]),
+                               min(128, seg_mask.shape[1]),
+                               min(128, seg_mask.shape[2])))
+
+        root.attrs['study_id'] = study_id
+        root.attrs['patient_id'] = info["patient_id"]
+        root.attrs['annotation_type'] = annotation_type
+        root.attrs['ct_series_uid'] = ct_series_uid
+        root.attrs['spacing'] = list(spacing)
 
     return study_id
 
@@ -323,50 +339,69 @@ class LNQDataset:
         return study
 
     def _cache_path(self, study_id: str) -> Optional[Path]:
-        """Return the .npz cache file path for a study, or None if caching is disabled."""
+        """Return the zarr cache directory path for a study."""
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"{study_id}.npz"
+        return self.cache_dir / f"{study_id}.zarr"
 
     def _save_to_cache(self, study: StudyData) -> None:
-        """Save a study to the local disk cache as .npz."""
+        """Save a study to local disk cache as zarr with blosc compression."""
         path = self._cache_path(study.study_id)
         if path is None:
             return
         try:
+            import zarr
+            from numcodecs import Blosc
+
             path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                path,
-                volume=study.volume,
-                seg_mask=study.seg_mask if study.seg_mask is not None else np.array([]),
-                spacing=np.array(study.spacing),
-                meta=np.array([
-                    study.study_id, study.patient_id,
-                    study.annotation_type, study.ct_series_uid,
-                ]),
-            )
+            compressor = Blosc(cname='lz4', clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+            store = zarr.DirectoryStore(str(path))
+            root = zarr.group(store, overwrite=True)
+
+            root.array('volume', study.volume, compressor=compressor,
+                       chunks=(min(64, study.volume.shape[0]),
+                               min(128, study.volume.shape[1]),
+                               min(128, study.volume.shape[2])))
+
+            if study.seg_mask is not None:
+                root.array('seg_mask', study.seg_mask, compressor=compressor,
+                           chunks=(min(64, study.seg_mask.shape[0]),
+                                   min(128, study.seg_mask.shape[1]),
+                                   min(128, study.seg_mask.shape[2])))
+
+            root.attrs['study_id'] = study.study_id
+            root.attrs['patient_id'] = study.patient_id
+            root.attrs['annotation_type'] = study.annotation_type
+            root.attrs['ct_series_uid'] = study.ct_series_uid
+            root.attrs['spacing'] = list(study.spacing)
+
         except Exception as e:
             logger.warning(f"Failed to cache {study.study_id}: {e}")
 
     def _load_from_cache(self, study_id: str) -> Optional[StudyData]:
-        """Load a study from the local disk cache. Returns None on miss."""
+        """Load a study from local zarr cache. Blosc decompression is fast
+        and releases the GIL, so multiple threads can decompress in parallel."""
         path = self._cache_path(study_id)
         if path is None or not path.exists():
             return None
         try:
-            data = np.load(path, allow_pickle=False)
-            seg_mask = data["seg_mask"]
-            if seg_mask.ndim == 0 or seg_mask.size == 0:
-                seg_mask = None
-            meta = data["meta"]
+            import zarr
+
+            store = zarr.DirectoryStore(str(path))
+            root = zarr.open(store, mode='r')
+
+            volume = root['volume'][:]
+            seg_mask = root['seg_mask'][:] if 'seg_mask' in root else None
+
             return StudyData(
-                study_id=str(meta[0]),
-                patient_id=str(meta[1]),
-                volume=data["volume"],
-                spacing=tuple(data["spacing"].tolist()),
+                study_id=root.attrs['study_id'],
+                patient_id=root.attrs['patient_id'],
+                volume=volume,
+                spacing=tuple(root.attrs['spacing']),
                 seg_mask=seg_mask,
-                annotation_type=str(meta[2]),
-                ct_series_uid=str(meta[3]),
+                annotation_type=root.attrs['annotation_type'],
+                ct_series_uid=root.attrs['ct_series_uid'],
             )
         except Exception as e:
             logger.warning(f"Cache read failed for {study_id}: {e}")

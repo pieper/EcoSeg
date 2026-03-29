@@ -16,6 +16,7 @@ dependencies = [
     "pydicom",
     "scipy",
     "scikit-image",
+    "zarr>=2.0",
 ]
 
 [project.optional-dependencies]
