@@ -398,9 +398,14 @@ class ExperimentRunner:
         fully_ids: list[str],
         partial_ids: list[str],
     ) -> float:
-        """Train species heads on pre-computed embeddings."""
+        """Train species heads on pre-computed embeddings.
+
+        Memory-efficient: extracts feature vectors only at labeled voxel
+        positions from the zarr cache, never loading full embedding volumes.
+        A scan with 1000 labeled voxels uses ~64KB instead of ~1GB.
+        """
         from scipy import ndimage
-        from ecoseg.models.head_trainer import HeadTrainingConfig, train_species_head
+        from ecoseg.models.head_trainer import HeadTrainingConfig, train_species_head_from_features
 
         t0 = time.time()
 
@@ -409,29 +414,28 @@ class ExperimentRunner:
             self.ecosegnet.add_species(name)
         self.ecosegnet.to(self.device)
 
-        volumes = []
-        embeddings_list = []
-        ln_masks = []
-        bg_masks = []
+        # Collect feature vectors at labeled positions (not full embeddings)
+        ln_features_all = []
+        ln_labels_all = []
+        bg_features_all = []
+        bg_labels_all = []
 
-        def _prepare(sid, annotation_type):
+        all_ids = list(fully_ids) + list(partial_ids)
+        all_types = ["fully_annotated"] * len(fully_ids) + ["partially_annotated"] * len(partial_ids)
+
+        for sid, ann_type in zip(all_ids, all_types):
             study = self.dataset.load_study(sid)
             vol = normalize_ct(study.volume)
-            volumes.append(vol)
 
-            # Get or compute embeddings
-            emb = self.emb_cache.encode_and_cache(
-                self.ecosegnet, sid, vol, self.device
-            )
-            embeddings_list.append(emb)
+            # Ensure embeddings are cached (compute if needed)
+            self.emb_cache.ensure_cached(self.ecosegnet, sid, vol, self.device)
 
             if study.seg_mask is None:
-                return
+                continue
 
             ln_mask = (study.seg_mask > 0).astype(np.uint8)
-            ln_masks.append(ln_mask)
 
-            if annotation_type == "fully_annotated":
+            if ann_type == "fully_annotated":
                 bg_mask = (study.seg_mask == 0).astype(np.uint8)
             else:
                 if study.spacing[0] > 3.0:
@@ -442,39 +446,76 @@ class ExperimentRunner:
                 dilated = ndimage.binary_dilation(ln_mask.astype(bool), struct)
                 bg_mask = (dilated & ~ln_mask.astype(bool)).astype(np.uint8)
 
-            bg_masks.append(bg_mask)
+            # Sample voxel coordinates for LN training
+            pos_coords = np.argwhere(ln_mask > 0)
+            neg_coords_ln = np.argwhere(ln_mask == 0)
+            # Hard negatives: sample from similar-intensity tissue
+            if len(pos_coords) > 0:
+                pos_vals = vol[ln_mask > 0]
+                lo, hi = np.percentile(pos_vals, [10, 90])
+                tissue_neg = np.argwhere((ln_mask == 0) & (vol >= lo) & (vol <= hi))
+                if len(tissue_neg) > 100:
+                    neg_coords_ln = tissue_neg
 
-        for sid in fully_ids:
-            _prepare(sid, "fully_annotated")
-        for sid in partial_ids:
-            _prepare(sid, "partially_annotated")
+            n_sample = min(1000, len(pos_coords))
+            if n_sample > 0:
+                idx_pos = self.rng.choice(len(pos_coords), size=n_sample, replace=len(pos_coords) < n_sample)
+                idx_neg = self.rng.choice(len(neg_coords_ln), size=n_sample, replace=len(neg_coords_ln) < n_sample)
+
+                pos_feats = self.emb_cache.extract_at_coords(sid, pos_coords[idx_pos])
+                neg_feats = self.emb_cache.extract_at_coords(sid, neg_coords_ln[idx_neg])
+
+                if pos_feats is not None and neg_feats is not None:
+                    ln_features_all.append(np.concatenate([pos_feats, neg_feats]))
+                    ln_labels_all.append(np.concatenate([
+                        np.ones(len(pos_feats), dtype=np.float32),
+                        np.zeros(len(neg_feats), dtype=np.float32),
+                    ]))
+
+            # Sample for BG training
+            pos_coords_bg = np.argwhere(bg_mask > 0)
+            neg_coords_bg = np.argwhere(bg_mask == 0)
+            n_sample_bg = min(1000, len(pos_coords_bg))
+            if n_sample_bg > 0:
+                idx_pos_bg = self.rng.choice(len(pos_coords_bg), size=n_sample_bg, replace=len(pos_coords_bg) < n_sample_bg)
+                idx_neg_bg = self.rng.choice(len(neg_coords_bg), size=min(n_sample_bg, len(neg_coords_bg)), replace=len(neg_coords_bg) < n_sample_bg)
+
+                pos_feats_bg = self.emb_cache.extract_at_coords(sid, pos_coords_bg[idx_pos_bg])
+                neg_feats_bg = self.emb_cache.extract_at_coords(sid, neg_coords_bg[idx_neg_bg])
+
+                if pos_feats_bg is not None and neg_feats_bg is not None:
+                    bg_features_all.append(np.concatenate([pos_feats_bg, neg_feats_bg]))
+                    bg_labels_all.append(np.concatenate([
+                        np.ones(len(pos_feats_bg), dtype=np.float32),
+                        np.zeros(len(neg_feats_bg), dtype=np.float32),
+                    ]))
 
         logger.info(
-            f"Training heads on {len(fully_ids)} full + {len(partial_ids)} partial scans "
-            f"({len(ln_masks)} with LN masks, {len(bg_masks)} with BG masks)"
+            f"Training heads on {len(fully_ids)} full + {len(partial_ids)} partial scans"
         )
 
         head_config = HeadTrainingConfig()
 
         # Train lymph node head
-        ln_head = self.ecosegnet.species_heads["lymph_node"]
-        if ln_masks:
-            # Use embeddings corresponding to scans that have LN masks
-            ln_embs = embeddings_list[:len(ln_masks)]
-            train_species_head(
-                ln_head, ln_embs, ln_masks,
+        if ln_features_all:
+            all_feats = torch.tensor(np.concatenate(ln_features_all))
+            all_labels = torch.tensor(np.concatenate(ln_labels_all))
+            logger.info(f"LN head: {len(all_labels)} vectors ({(all_labels == 1).sum()} pos, {(all_labels == 0).sum()} neg)")
+            train_species_head_from_features(
+                self.ecosegnet.species_heads["lymph_node"],
+                all_feats, all_labels,
                 config=head_config, device=self.device,
-                volumes=volumes[:len(ln_masks)], rng=self.rng,
             )
 
         # Train background head
-        bg_head = self.ecosegnet.species_heads["background"]
-        if bg_masks:
-            bg_embs = embeddings_list[:len(bg_masks)]
-            train_species_head(
-                bg_head, bg_embs, bg_masks,
+        if bg_features_all:
+            all_feats = torch.tensor(np.concatenate(bg_features_all))
+            all_labels = torch.tensor(np.concatenate(bg_labels_all))
+            logger.info(f"BG head: {len(all_labels)} vectors ({(all_labels == 1).sum()} pos, {(all_labels == 0).sum()} neg)")
+            train_species_head_from_features(
+                self.ecosegnet.species_heads["background"],
+                all_feats, all_labels,
                 config=head_config, device=self.device,
-                volumes=volumes[:len(bg_masks)], rng=self.rng,
             )
 
         return time.time() - t0

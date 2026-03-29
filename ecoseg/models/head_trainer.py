@@ -198,3 +198,72 @@ def train_species_head(
     logger.info(f"Head training: {elapsed:.1f}s, final loss={epoch_losses[-1]:.4f}")
 
     return epoch_losses
+
+
+def train_species_head_from_features(
+    head: SpeciesHead,
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    config: HeadTrainingConfig = HeadTrainingConfig(),
+    device: torch.device | str = "cpu",
+) -> list[float]:
+    """Train a species head directly from pre-extracted feature vectors.
+
+    This is the memory-efficient path: features have already been extracted
+    at labeled voxel positions from the zarr cache, so no full embedding
+    volumes are in memory.
+
+    Args:
+        head: the species decoder head to train
+        features: (N, feature_dim) float32 tensor
+        labels: (N,) float32 tensor of 0.0/1.0
+        config: training hyperparameters
+        device: compute device
+
+    Returns:
+        List of per-epoch average loss values
+    """
+    device = torch.device(device)
+    t0 = time.time()
+
+    feats_t = features.to(device)
+    labels_t = labels.to(device)
+    n_samples = len(labels_t)
+
+    # Reshape for conv1x1x1: (N, feature_dim) -> (N, feature_dim, 1, 1, 1)
+    feats_5d = feats_t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+    head.to(device)
+    head.train()
+    optimizer = optim.AdamW(head.parameters(), lr=config.learning_rate,
+                            weight_decay=config.weight_decay)
+    criterion = nn.BCELoss()
+
+    epoch_losses = []
+    for epoch in range(config.num_epochs):
+        perm = torch.randperm(n_samples, device=device)
+        total_loss = 0.0
+        count = 0
+
+        for start in range(0, n_samples, config.batch_size):
+            idx = perm[start:start + config.batch_size]
+            batch_feats = feats_5d[idx]
+            batch_labels = labels_t[idx]
+
+            optimizer.zero_grad()
+            preds = head(batch_feats).squeeze()
+            loss = criterion(preds, batch_labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * len(batch_labels)
+            count += len(batch_labels)
+
+        avg_loss = total_loss / count if count > 0 else 0.0
+        epoch_losses.append(avg_loss)
+
+    head.eval()
+    elapsed = time.time() - t0
+    logger.info(f"Head training: {elapsed:.1f}s, final loss={epoch_losses[-1]:.4f}")
+
+    return epoch_losses

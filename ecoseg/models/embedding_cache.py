@@ -81,6 +81,55 @@ class EmbeddingCache:
             logger.warning(f"Embedding cache read failed for {study_id}: {e}")
             return None
 
+    def extract_at_coords(
+        self,
+        study_id: str,
+        coords: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Extract feature vectors at specific voxel coordinates from cache.
+
+        Reads only the needed chunks from zarr, avoiding loading the full
+        embedding volume into memory. For a scan with 1000 labeled voxels,
+        this reads ~64KB instead of ~1GB.
+
+        Args:
+            study_id: study identifier
+            coords: (N, 3) int array of (z, y, x) voxel coordinates
+
+        Returns:
+            (N, feature_dim) float32 array, or None on cache miss
+        """
+        path = self._path(study_id)
+        if not path.exists():
+            return None
+        try:
+            import zarr
+            root = zarr.open_group(str(path), mode='r')
+            emb = root['embeddings']  # Don't load full array — lazy access
+
+            # Extract feature vectors at each coordinate
+            features = np.zeros((len(coords), self.feature_dim), dtype=np.float32)
+            for i, (z, y, x) in enumerate(coords):
+                features[i] = emb[:, z, y, x]
+
+            return features
+        except Exception as e:
+            logger.warning(f"Feature extraction failed for {study_id}: {e}")
+            return None
+
+    def ensure_cached(
+        self,
+        model: 'EcoSegNet',
+        study_id: str,
+        volume: np.ndarray,
+        device: torch.device,
+    ) -> bool:
+        """Ensure embeddings are cached for a study. Returns True if cached."""
+        if self.has(study_id):
+            return True
+        self.encode_and_cache(model, study_id, volume, device)
+        return self.has(study_id)
+
     def encode_and_cache(
         self,
         model: 'EcoSegNet',
