@@ -88,9 +88,12 @@ class EmbeddingCache:
     ) -> Optional[np.ndarray]:
         """Extract feature vectors at specific voxel coordinates from cache.
 
-        Reads only the needed chunks from zarr, avoiding loading the full
-        embedding volume into memory. For a scan with 1000 labeled voxels,
-        this reads ~64KB instead of ~1GB.
+        Loads the full embedding array once (blosc decompresses all chunks
+        in one pass) then indexes into it. This is faster than per-voxel
+        random access which re-decompresses chunks repeatedly.
+
+        Uses an LRU cache so repeated calls for the same study (e.g.,
+        LN and BG training from the same scan) don't re-read from disk.
 
         Args:
             study_id: study identifier
@@ -99,23 +102,37 @@ class EmbeddingCache:
         Returns:
             (N, feature_dim) float32 array, or None on cache miss
         """
-        path = self._path(study_id)
-        if not path.exists():
+        emb = self._get_cached_embedding(study_id)
+        if emb is None:
             return None
-        try:
-            import zarr
-            root = zarr.open_group(str(path), mode='r')
-            emb = root['embeddings']  # Don't load full array — lazy access
 
-            # Extract feature vectors at each coordinate
-            features = np.zeros((len(coords), self.feature_dim), dtype=np.float32)
-            for i, (z, y, x) in enumerate(coords):
-                features[i] = emb[:, z, y, x]
+        # Vectorized indexing — no Python loop
+        z, y, x = coords[:, 0], coords[:, 1], coords[:, 2]
+        features = emb[:, z, y, x].T.astype(np.float32)  # (N, feature_dim)
+        return features
 
-            return features
-        except Exception as e:
-            logger.warning(f"Feature extraction failed for {study_id}: {e}")
+    def _get_cached_embedding(self, study_id: str) -> Optional[np.ndarray]:
+        """Load embedding with simple LRU cache (keep last few in memory)."""
+        if not hasattr(self, '_emb_lru'):
+            self._emb_lru: dict[str, np.ndarray] = {}
+            self._emb_lru_order: list[str] = []
+            self._emb_lru_max = 5  # Keep at most 5 scans in memory (~5GB)
+
+        if study_id in self._emb_lru:
+            return self._emb_lru[study_id]
+
+        emb = self.load(study_id)
+        if emb is None:
             return None
+
+        # Add to cache, evict oldest if full
+        self._emb_lru[study_id] = emb
+        self._emb_lru_order.append(study_id)
+        while len(self._emb_lru_order) > self._emb_lru_max:
+            evict = self._emb_lru_order.pop(0)
+            self._emb_lru.pop(evict, None)
+
+        return emb
 
     def ensure_cached(
         self,
