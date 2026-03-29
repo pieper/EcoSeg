@@ -115,38 +115,34 @@ class EcoSegNet(nn.Module):
         from monai.networks.nets import SwinUNETR
 
         model = SwinUNETR(
-            img_size=self.config.patch_size,
             in_channels=1,
             out_channels=1,  # We won't use the decoder output
             feature_size=48,
+            spatial_dims=3,
             use_v2=True,
         )
 
         if self.config.pretrained:
             try:
-                from monai.bundle import download
-                # Download pre-trained weights
-                weight_path = download(
-                    name="swin_unetr_btcv_segmentation",
-                    bundle_dir=str(Path.home() / ".ecoseg" / "models"),
-                )
-                # Load only the encoder weights
-                state = torch.load(
-                    Path(weight_path) / "models" / "model.pt",
-                    map_location="cpu",
-                    weights_only=True,
-                )
-                # Filter to only swinViT (encoder) weights
-                encoder_state = {
-                    k: v for k, v in state.items()
-                    if k.startswith("swinViT.") or k.startswith("encoder")
-                }
-                if encoder_state:
-                    model.load_state_dict(encoder_state, strict=False)
-                    logger.info("Loaded pre-trained SwinUNETR encoder weights")
-                else:
-                    model.load_state_dict(state, strict=False)
-                    logger.info("Loaded pre-trained SwinUNETR weights (full model)")
+                # Try to download BTCV pre-trained weights
+                weight_dir = Path.home() / ".ecoseg" / "models"
+                weight_dir.mkdir(parents=True, exist_ok=True)
+                weight_file = weight_dir / "swin_unetr_btcv.pt"
+
+                if not weight_file.exists():
+                    logger.info("Downloading pre-trained SwinUNETR weights...")
+                    url = (
+                        "https://github.com/Project-MONAI/MONAI-extra-test-data/"
+                        "releases/download/0.8.1/model_swinvit.pt"
+                    )
+                    torch.hub.download_url_to_file(url, str(weight_file))
+
+                state = torch.load(str(weight_file), map_location="cpu", weights_only=True)
+                # The pre-trained file contains swinViT weights
+                if "state_dict" in state:
+                    state = state["state_dict"]
+                model.swinViT.load_state_dict(state, strict=False)
+                logger.info("Loaded pre-trained SwinUNETR encoder weights")
             except Exception as e:
                 logger.warning(f"Could not load pre-trained weights: {e}")
                 logger.info("Using randomly initialized encoder")
