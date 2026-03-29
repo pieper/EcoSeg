@@ -81,14 +81,23 @@ def encode_crop(
     model: EcoSegNet,
     volume_crop: np.ndarray,
     device: torch.device,
+    target_dim: int = 32,
 ) -> torch.Tensor:
-    """Encode a cropped volume on GPU using raw multi-scale features.
+    """Encode a cropped volume on GPU using multi-scale features, reduced via PCA.
 
-    Returns the full 720-dim features (not projected) to preserve
-    maximum discrimination. The projector is untrained and would
-    destroy the feature quality.
+    Computes raw 720-dim features from the encoder, then applies PCA
+    to reduce to target_dim while preserving the most discriminative
+    variance. This is much better than the random projector because
+    PCA is fitted to the actual data distribution.
 
-    Pads to multiples of 32 for the encoder, then crops back.
+    Args:
+        model: EcoSegNet with frozen encoder
+        volume_crop: (D, H, W) normalized CT volume
+        device: compute device
+        target_dim: output embedding dimension (default 32)
+
+    Returns:
+        (target_dim, D, H, W) tensor on GPU — PCA-reduced embeddings
     """
     from monai.inferers import SlidingWindowInferer
 
@@ -97,7 +106,7 @@ def encode_crop(
     vol_t = torch.tensor(volume_crop, dtype=torch.float32, device=device)
     vol_t = vol_t.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
 
-    # Pad to multiples of 32 (SwinUNETR requirement for patch embedding)
+    # Pad to multiples of 32
     pad_d = (32 - D % 32) % 32
     pad_h = (32 - H % 32) % 32
     pad_w = (32 - W % 32) % 32
@@ -112,16 +121,47 @@ def encode_crop(
     )
 
     with torch.no_grad():
-        # Use raw multi-scale features — skip the untrained projector
         def _encode_patch(x):
             return model._multiscale_features(x)
 
         emb = inferer(vol_t, _encode_patch)
 
-    # Crop back to original size
-    emb = emb[:, :, :D, :H, :W]
+    # Crop back to original size: (1, 720, D, H, W)
+    emb = emb[:, :, :D, :H, :W].squeeze(0)  # (720, D, H, W)
 
-    return emb.squeeze(0)  # (720, D, H, W)
+    # PCA reduction on GPU: 720 -> target_dim
+    C = emb.shape[0]
+    flat = emb.reshape(C, -1)  # (720, N) where N = D*H*W
+
+    # Center the data
+    mean = flat.mean(dim=1, keepdim=True)  # (720, 1)
+    centered = flat - mean
+
+    # Compute covariance and top eigenvectors via SVD on a subsample
+    # (full SVD on 720×N is too expensive; subsample N to 50K)
+    N = centered.shape[1]
+    if N > 50000:
+        idx = torch.randperm(N, device=device)[:50000]
+        subsample = centered[:, idx]  # (720, 50000)
+    else:
+        subsample = centered
+
+    # SVD: subsample = U @ S @ Vt, we want the top target_dim columns of U
+    U, S, _ = torch.linalg.svd(subsample, full_matrices=False)
+    components = U[:, :target_dim]  # (720, target_dim)
+
+    # Project all voxels: (target_dim, 720) @ (720, N) -> (target_dim, N)
+    projected = components.T @ centered  # (target_dim, N)
+
+    # Reshape back to spatial
+    result = projected.reshape(target_dim, D, H, W)
+
+    logger.info(
+        f"PCA: 720 -> {target_dim} dims, "
+        f"variance explained: {(S[:target_dim]**2).sum() / (S**2).sum():.1%}"
+    )
+
+    return result
 
 
 def run_experiment(args):

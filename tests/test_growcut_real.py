@@ -47,8 +47,8 @@ def diagnose(data_root: str, cache_dir: str, device_str: str = "cuda"):
     enc_config = EncoderConfig(feature_dim=16, pretrained=True)
     model = EcoSegNet(enc_config).to(device)
 
-    print("Encoding (raw 720-dim features, no projection)...")
-    emb_crop = encode_crop(model, vol_crop, device)
+    print("Encoding (720-dim features, PCA to 32)...")
+    emb_crop = encode_crop(model, vol_crop, device, target_dim=32)
     print(f"Embedding shape: {emb_crop.shape}")
     print(f"Embedding range: [{emb_crop.min():.4f}, {emb_crop.max():.4f}]")
     print(f"Embedding mean: {emb_crop.mean():.4f}, std: {emb_crop.std():.4f}")
