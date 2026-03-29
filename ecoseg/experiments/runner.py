@@ -40,7 +40,12 @@ class ExperimentConfig:
 
     # Species configuration
     architecture: str = "cnn3"
+    model_type: str = "species"  # "species" (original) or "encoder" (EcoSegNet)
     species_names: list[str] = field(default_factory=lambda: ["lymph_node", "background"])
+
+    # Encoder config (only used when model_type == "encoder")
+    feature_dim: int = 16
+    embedding_cache_dir: Optional[str] = None
 
     # Training
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -108,10 +113,14 @@ class ExperimentRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self.device = config.resolve_device()
-        self.registry = SpeciesRegistry(device=self.device)
         self.results: list[GenerationResult] = []
         self.dataset: Optional[LNQDataset] = None
         self.rng = np.random.default_rng(42)
+
+        # Model — either species registry or EcoSegNet
+        self.registry: Optional[SpeciesRegistry] = None
+        self.ecosegnet: Optional['EcoSegNet'] = None
+        self.emb_cache: Optional['EmbeddingCache'] = None
 
         # Output directory
         self.output_dir = Path(config.output_dir) / config.name
@@ -120,7 +129,7 @@ class ExperimentRunner:
         logger.info(f"Experiment '{config.name}' using device: {self.device}")
 
     def setup(self) -> None:
-        """Initialize dataset and create species.
+        """Initialize dataset and create model.
 
         Only loads the studies needed for the first generation (validation +
         test). Remaining studies are pre-loaded in a background thread so
@@ -132,14 +141,10 @@ class ExperimentRunner:
         self.dataset = LNQDataset(Path(self.config.data_root), cache_dir=cache_path)
         self.dataset.discover_studies()
 
-        # Create species
-        for name in self.config.species_names:
-            self.registry.add_species(name, self.config.architecture)
-
-        logger.info(
-            f"Created {len(self.registry.species)} species: "
-            f"{self.registry.species_names}"
-        )
+        if self.config.model_type == "encoder":
+            self._setup_encoder()
+        else:
+            self._setup_species()
 
         # Load only the studies needed for generation 0
         validation_ids = self.dataset.get_validation_ids(self.config.num_validation)
@@ -161,6 +166,40 @@ class ExperimentRunner:
             self._bg_loader.start()
         else:
             self._bg_loader = None
+
+    def _setup_species(self) -> None:
+        """Initialize the original species registry."""
+        self.registry = SpeciesRegistry(device=self.device)
+        for name in self.config.species_names:
+            self.registry.add_species(name, self.config.architecture)
+        logger.info(
+            f"Created {len(self.registry.species)} species: "
+            f"{self.registry.species_names}"
+        )
+
+    def _setup_encoder(self) -> None:
+        """Initialize EcoSegNet with shared encoder + species heads."""
+        from ecoseg.models.ecosegnet import EcoSegNet, EncoderConfig
+        from ecoseg.models.embedding_cache import EmbeddingCache
+
+        enc_config = EncoderConfig(feature_dim=self.config.feature_dim)
+        self.ecosegnet = EcoSegNet(enc_config).to(self.device)
+
+        for name in self.config.species_names:
+            self.ecosegnet.add_species(name)
+
+        # Set up embedding cache
+        emb_cache_dir = Path(
+            self.config.embedding_cache_dir
+            or self.config.cache_dir
+            or str(Path.home() / ".ecoseg" / "cache")
+        )
+        self.emb_cache = EmbeddingCache(emb_cache_dir, self.config.feature_dim)
+
+        logger.info(
+            f"Created EcoSegNet with {len(self.ecosegnet.species_names)} species heads: "
+            f"{self.ecosegnet.species_names}"
+        )
 
     def _wait_for_background_load(self) -> None:
         """Wait for background pre-loading to finish, if still running."""
@@ -345,6 +384,140 @@ class ExperimentRunner:
         elapsed = time.time() - t0
         return scores, elapsed
 
+    # --- Encoder-based methods ---
+
+    def train_on_studies_encoder(
+        self,
+        fully_ids: list[str],
+        partial_ids: list[str],
+    ) -> float:
+        """Train species heads on pre-computed embeddings."""
+        from scipy import ndimage
+        from ecoseg.models.head_trainer import HeadTrainingConfig, train_species_head
+
+        t0 = time.time()
+
+        # Re-initialize species heads
+        for name in self.config.species_names:
+            self.ecosegnet.add_species(name)
+        self.ecosegnet.to(self.device)
+
+        volumes = []
+        embeddings_list = []
+        ln_masks = []
+        bg_masks = []
+
+        def _prepare(sid, annotation_type):
+            study = self.dataset.load_study(sid)
+            vol = normalize_ct(study.volume)
+            volumes.append(vol)
+
+            # Get or compute embeddings
+            emb = self.emb_cache.encode_and_cache(
+                self.ecosegnet, sid, vol, self.device
+            )
+            embeddings_list.append(emb)
+
+            if study.seg_mask is None:
+                return
+
+            ln_mask = (study.seg_mask > 0).astype(np.uint8)
+            ln_masks.append(ln_mask)
+
+            if annotation_type == "fully_annotated":
+                bg_mask = (study.seg_mask == 0).astype(np.uint8)
+            else:
+                if study.spacing[0] > 3.0:
+                    struct = np.zeros((3, 3, 3), dtype=bool)
+                    struct[1, :, :] = True
+                else:
+                    struct = np.ones((3, 3, 3), dtype=bool)
+                dilated = ndimage.binary_dilation(ln_mask.astype(bool), struct)
+                bg_mask = (dilated & ~ln_mask.astype(bool)).astype(np.uint8)
+
+            bg_masks.append(bg_mask)
+
+        for sid in fully_ids:
+            _prepare(sid, "fully_annotated")
+        for sid in partial_ids:
+            _prepare(sid, "partially_annotated")
+
+        logger.info(
+            f"Training heads on {len(fully_ids)} full + {len(partial_ids)} partial scans "
+            f"({len(ln_masks)} with LN masks, {len(bg_masks)} with BG masks)"
+        )
+
+        head_config = HeadTrainingConfig()
+
+        # Train lymph node head
+        ln_head = self.ecosegnet.species_heads["lymph_node"]
+        if ln_masks:
+            # Use embeddings corresponding to scans that have LN masks
+            ln_embs = embeddings_list[:len(ln_masks)]
+            train_species_head(
+                ln_head, ln_embs, ln_masks,
+                config=head_config, device=self.device,
+                volumes=volumes[:len(ln_masks)], rng=self.rng,
+            )
+
+        # Train background head
+        bg_head = self.ecosegnet.species_heads["background"]
+        if bg_masks:
+            bg_embs = embeddings_list[:len(bg_masks)]
+            train_species_head(
+                bg_head, bg_embs, bg_masks,
+                config=head_config, device=self.device,
+                volumes=volumes[:len(bg_masks)], rng=self.rng,
+            )
+
+        return time.time() - t0
+
+    def evaluate_encoder(self, study_ids: list[str]) -> tuple[list[SegmentationScore], float]:
+        """Run inference using EcoSegNet and score against ground truth."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        t0 = time.time()
+        ln_index = self.ecosegnet.species_names.index("lymph_node")
+
+        scoring_futures = []
+
+        with ThreadPoolExecutor(max_workers=available_workers()) as scorer:
+            for i, sid in enumerate(study_ids):
+                study = self.dataset.load_study(sid)
+                vol = normalize_ct(study.volume)
+
+                # Get or compute embeddings
+                emb = self.emb_cache.encode_and_cache(
+                    self.ecosegnet, sid, vol, self.device
+                )
+
+                # Run species heads on embeddings
+                emb_t = torch.tensor(emb, dtype=torch.float32, device=self.device)
+                emb_t = emb_t.unsqueeze(0)  # (1, feature_dim, D, H, W)
+
+                with torch.no_grad():
+                    labels, fitness = self.ecosegnet.segment(emb_t)
+
+                prediction = (labels.squeeze(0) == ln_index).cpu().numpy().astype(np.uint8)
+
+                if study.seg_mask is not None:
+                    ground_truth = (study.seg_mask > 0).astype(np.uint8)
+                    future = scorer.submit(
+                        score_segmentation,
+                        sid, prediction, ground_truth, study.spacing,
+                    )
+                    scoring_futures.append(future)
+
+                if (i + 1) % 10 == 0:
+                    logger.info(f"  Inferred {i + 1}/{len(study_ids)} scans")
+
+            scores = []
+            for future in scoring_futures:
+                scores.append(future.result())
+
+        elapsed = time.time() - t0
+        return scores, elapsed
+
     def _collect_pending_evaluation(self) -> None:
         """If there's a pending evaluation from the previous generation,
         collect results and log them."""
@@ -400,14 +573,18 @@ class ExperimentRunner:
             f"evaluating on {len(eval_ids)} ==="
         )
 
-        train_time = self.train_on_studies(fully_ids, partial_ids)
+        if self.config.model_type == "encoder":
+            train_time = self.train_on_studies_encoder(fully_ids, partial_ids)
+        else:
+            train_time = self.train_on_studies(fully_ids, partial_ids)
 
         # Launch evaluation in background — GPU does inference while
         # the main thread can prepare the next generation's data
         if not hasattr(self, '_eval_pool'):
             self._eval_pool = ThreadPoolExecutor(max_workers=1)
 
-        future = self._eval_pool.submit(self.evaluate, eval_ids)
+        eval_fn = self.evaluate_encoder if self.config.model_type == "encoder" else self.evaluate
+        future = self._eval_pool.submit(eval_fn, eval_ids)
         self._pending_eval = (gen, total_train, train_time, future)
 
     def run_full_experiment(self) -> list[GenerationResult]:

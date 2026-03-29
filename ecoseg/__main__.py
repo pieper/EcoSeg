@@ -35,10 +35,15 @@ def main():
     run_parser.add_argument("--device", type=str, default="auto")
     run_parser.add_argument("--architecture", type=str, default="cnn3",
                             choices=["cnn3", "resnet"],
-                            help="Species model architecture")
+                            help="Species model architecture (for species model type)")
+    run_parser.add_argument("--model-type", type=str, default="species",
+                            choices=["species", "encoder"],
+                            help="Model type: 'species' (patch CNN) or 'encoder' (SwinUNETR + heads)")
     run_parser.add_argument("--cache-dir", type=str,
                             default=str(Path.home() / ".ecoseg" / "cache"),
-                            help="Local directory to cache loaded studies as .npz (default: ~/.ecoseg/cache)")
+                            help="Local directory to cache loaded studies (default: ~/.ecoseg/cache)")
+    run_parser.add_argument("--embedding-cache-dir", type=str, default=None,
+                            help="Directory for embedding cache (default: same as cache-dir)")
 
     args = parser.parse_args()
 
@@ -65,6 +70,8 @@ def main():
         config.output_dir = args.output_dir
         config.device = args.device
         config.architecture = args.architecture
+        config.model_type = args.model_type
+        config.embedding_cache_dir = args.embedding_cache_dir
         config.cache_dir = args.cache_dir
 
         runner = ExperimentRunner(config)
