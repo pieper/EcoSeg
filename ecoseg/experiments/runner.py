@@ -345,24 +345,16 @@ class ExperimentRunner:
         elapsed = time.time() - t0
         return scores, elapsed
 
-    def run_generation(
-        self,
-        fully_ids: list[str],
-        partial_ids: list[str],
-        eval_ids: list[str],
-    ) -> GenerationResult:
-        """Run one generation: train on all accumulated data, evaluate on eval_ids."""
-        gen = len(self.results)
-        total_train = len(fully_ids) + len(partial_ids)
-        logger.info(
-            f"=== Generation {gen}: training on {total_train} scans "
-            f"({len(fully_ids)} full + {len(partial_ids)} partial), "
-            f"evaluating on {len(eval_ids)} ==="
-        )
+    def _collect_pending_evaluation(self) -> None:
+        """If there's a pending evaluation from the previous generation,
+        collect results and log them."""
+        if not hasattr(self, '_pending_eval') or self._pending_eval is None:
+            return
 
-        train_time = self.train_on_studies(fully_ids, partial_ids)
-        scores, infer_time = self.evaluate(eval_ids)
+        gen, total_train, train_time, future = self._pending_eval
+        self._pending_eval = None
 
+        scores, infer_time = future.result()
         finite_assd = [s.assd for s in scores if np.isfinite(s.assd)]
 
         result = GenerationResult(
@@ -377,23 +369,52 @@ class ExperimentRunner:
         self.results.append(result)
 
         logger.info(
-            f"  Mean Dice: {result.mean_dice:.4f}, "
+            f"  Gen {gen} results: Mean Dice: {result.mean_dice:.4f}, "
             f"Mean ASSD: {result.mean_assd:.2f}mm, "
             f"Train: {train_time:.1f}s, Infer: {infer_time:.1f}s"
         )
-
-        # Save results
         self._save_generation(result)
 
-        return result
+    def run_generation(
+        self,
+        fully_ids: list[str],
+        partial_ids: list[str],
+        eval_ids: list[str],
+    ) -> None:
+        """Run one generation: collect previous eval, train, launch eval in background.
+
+        Evaluation (GPU inference + CPU scoring) runs in a background thread
+        so that the next generation's CPU-side data preparation can overlap.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Collect results from previous generation's evaluation (if any)
+        self._collect_pending_evaluation()
+
+        gen = len(self.results)
+        total_train = len(fully_ids) + len(partial_ids)
+        logger.info(
+            f"=== Generation {gen}: training on {total_train} scans "
+            f"({len(fully_ids)} full + {len(partial_ids)} partial), "
+            f"evaluating on {len(eval_ids)} ==="
+        )
+
+        train_time = self.train_on_studies(fully_ids, partial_ids)
+
+        # Launch evaluation in background — GPU does inference while
+        # the main thread can prepare the next generation's data
+        if not hasattr(self, '_eval_pool'):
+            self._eval_pool = ThreadPoolExecutor(max_workers=1)
+
+        future = self._eval_pool.submit(self.evaluate, eval_ids)
+        self._pending_eval = (gen, total_train, train_time, future)
 
     def run_full_experiment(self) -> list[GenerationResult]:
         """Run the complete incremental experiment.
 
-        1. Train on 20 validation scans (fully annotated)
-        2. Evaluate on 100 test scans
-        3. Incrementally add partial scans in batches of 20
-        4. Retrain on ALL accumulated data each generation, re-evaluate
+        Pipeline: while gen N evaluates on the GPU, gen N+1's data
+        preparation (patch extraction, normalization) runs on CPU.
 
         Training is cumulative: each generation trains on the 20 fully-
         annotated scans PLUS all partial scans added so far.
@@ -408,8 +429,6 @@ class ExperimentRunner:
             f"Test: {len(test_ids)} studies"
         )
 
-        # Accumulate training data across generations
-        # fully_annotated IDs are always included
         self._fully_annotated_ids = list(validation_ids)
         self._partial_annotated_ids: list[str] = []
 
@@ -440,9 +459,12 @@ class ExperimentRunner:
 
             self.run_generation(
                 self._fully_annotated_ids,
-                self._partial_annotated_ids,
+                list(self._partial_annotated_ids),  # copy to avoid mutation
                 test_ids,
             )
+
+        # Collect final generation's evaluation
+        self._collect_pending_evaluation()
 
         logger.info(
             f"Experiment complete: {len(self.results)} generations"

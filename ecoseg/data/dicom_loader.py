@@ -197,33 +197,43 @@ def _load_and_cache_worker(info: dict, study_id: str, cache_path: Optional[str])
     ct_series_uid = str(getattr(ct_datasets[0], "SeriesInstanceUID", ""))
 
     if cache_path is not None:
-        import zarr
-        from numcodecs import Blosc
-
-        out = Path(cache_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        compressor = Blosc(cname='lz4', clevel=3, shuffle=Blosc.BITSHUFFLE)
-
-        store = zarr.DirectoryStore(str(out))
-        root = zarr.group(store, overwrite=True)
-
-        root.array('volume', volume, compressor=compressor,
-                   chunks=(min(64, volume.shape[0]),
-                           min(128, volume.shape[1]),
-                           min(128, volume.shape[2])))
-        if seg_mask is not None:
-            root.array('seg_mask', seg_mask, compressor=compressor,
-                       chunks=(min(64, seg_mask.shape[0]),
-                               min(128, seg_mask.shape[1]),
-                               min(128, seg_mask.shape[2])))
-
-        root.attrs['study_id'] = study_id
-        root.attrs['patient_id'] = info["patient_id"]
-        root.attrs['annotation_type'] = annotation_type
-        root.attrs['ct_series_uid'] = ct_series_uid
-        root.attrs['spacing'] = list(spacing)
+        _write_zarr_cache(
+            cache_path, volume, seg_mask, spacing,
+            study_id, info["patient_id"], annotation_type, ct_series_uid,
+        )
 
     return study_id
+
+
+def _write_zarr_cache(
+    cache_path: str, volume, seg_mask, spacing,
+    study_id, patient_id, annotation_type, ct_series_uid,
+):
+    """Write study data to zarr v3 with blosc compression."""
+    import zarr
+    from zarr.codecs import BloscCodec
+
+    out = Path(cache_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    comp = BloscCodec(cname='lz4', clevel=3)
+
+    root = zarr.open_group(str(out), mode='w')
+
+    root.create_array('volume', data=volume, compressors=[comp],
+                      chunks=(min(64, volume.shape[0]),
+                              min(128, volume.shape[1]),
+                              min(128, volume.shape[2])))
+    if seg_mask is not None:
+        root.create_array('seg_mask', data=seg_mask, compressors=[comp],
+                          chunks=(min(64, seg_mask.shape[0]),
+                                  min(128, seg_mask.shape[1]),
+                                  min(128, seg_mask.shape[2])))
+
+    root.attrs['study_id'] = study_id
+    root.attrs['patient_id'] = patient_id
+    root.attrs['annotation_type'] = annotation_type
+    root.attrs['ct_series_uid'] = ct_series_uid
+    root.attrs['spacing'] = list(spacing)
 
 
 class LNQDataset:
@@ -350,32 +360,11 @@ class LNQDataset:
         if path is None:
             return
         try:
-            import zarr
-            from numcodecs import Blosc
-
-            path.parent.mkdir(parents=True, exist_ok=True)
-            compressor = Blosc(cname='lz4', clevel=3, shuffle=Blosc.BITSHUFFLE)
-
-            store = zarr.DirectoryStore(str(path))
-            root = zarr.group(store, overwrite=True)
-
-            root.array('volume', study.volume, compressor=compressor,
-                       chunks=(min(64, study.volume.shape[0]),
-                               min(128, study.volume.shape[1]),
-                               min(128, study.volume.shape[2])))
-
-            if study.seg_mask is not None:
-                root.array('seg_mask', study.seg_mask, compressor=compressor,
-                           chunks=(min(64, study.seg_mask.shape[0]),
-                                   min(128, study.seg_mask.shape[1]),
-                                   min(128, study.seg_mask.shape[2])))
-
-            root.attrs['study_id'] = study.study_id
-            root.attrs['patient_id'] = study.patient_id
-            root.attrs['annotation_type'] = study.annotation_type
-            root.attrs['ct_series_uid'] = study.ct_series_uid
-            root.attrs['spacing'] = list(study.spacing)
-
+            _write_zarr_cache(
+                str(path), study.volume, study.seg_mask, study.spacing,
+                study.study_id, study.patient_id,
+                study.annotation_type, study.ct_series_uid,
+            )
         except Exception as e:
             logger.warning(f"Failed to cache {study.study_id}: {e}")
 
@@ -388,8 +377,7 @@ class LNQDataset:
         try:
             import zarr
 
-            store = zarr.DirectoryStore(str(path))
-            root = zarr.open(store, mode='r')
+            root = zarr.open_group(str(path), mode='r')
 
             volume = root['volume'][:]
             seg_mask = root['seg_mask'][:] if 'seg_mask' in root else None
