@@ -411,7 +411,7 @@ class ExperimentRunner:
         self._pending_eval = (gen, total_train, train_time, future)
 
     def run_full_experiment(self) -> list[GenerationResult]:
-        """Run the complete incremental experiment.
+        """Run the complete incremental experiment, resuming from checkpoint if available.
 
         Pipeline: while gen N evaluates on the GPU, gen N+1's data
         preparation (patch extraction, normalization) runs on CPU.
@@ -424,31 +424,56 @@ class ExperimentRunner:
         validation_ids = self.dataset.get_validation_ids(self.config.num_validation)
         test_ids = self.dataset.get_test_ids(self.config.num_validation)
 
+        # Try to resume from checkpoint
+        resumed = self.load_checkpoint()
+
+        if not resumed:
+            self._fully_annotated_ids = list(validation_ids)
+            self._partial_annotated_ids = []
+
         logger.info(
             f"Validation: {len(validation_ids)} studies, "
             f"Test: {len(test_ids)} studies"
+            + (f" (resumed from gen {len(self.results)})" if resumed else "")
         )
 
-        self._fully_annotated_ids = list(validation_ids)
-        self._partial_annotated_ids: list[str] = []
-
-        # Generation 0: train on fully-annotated validation set only
-        self.run_generation(
-            self._fully_annotated_ids, [], test_ids,
-        )
-
-        # Ensure background loading is done before we need partial scans
-        self._wait_for_background_load()
-
-        # Get partially annotated study IDs
+        # Get partially annotated study IDs (deterministic order)
         all_ids = set(self.dataset._index.keys())
         fully_ids = set(validation_ids) | set(test_ids)
         partial_ids = sorted(all_ids - fully_ids)
 
-        # Add partial scans in batches — training is cumulative
+        # Build list of all generations we need to run
         batch_size = self.config.batch_size_partial
+        all_batches = []
         for i in range(0, len(partial_ids), batch_size):
-            batch = partial_ids[i:i + batch_size]
+            all_batches.append(partial_ids[i:i + batch_size])
+
+        # Figure out which generation to start from
+        start_gen = len(self.results)
+
+        if start_gen == 0:
+            # Generation 0: train on fully-annotated validation set only
+            self.run_generation(
+                self._fully_annotated_ids, [], test_ids,
+            )
+            start_gen = 1
+
+        # Ensure background loading is done before we need partial scans
+        self._wait_for_background_load()
+
+        # Run remaining generations, skipping already-completed ones
+        for batch_idx in range(len(all_batches)):
+            gen_num = batch_idx + 1  # gen 0 is the initial fully-annotated run
+
+            if gen_num < start_gen:
+                # Already completed — just accumulate the partial IDs
+                # (only needed if not restored from checkpoint)
+                if not resumed:
+                    self._partial_annotated_ids.extend(all_batches[batch_idx])
+                continue
+
+            # Add this batch
+            batch = all_batches[batch_idx]
             self._partial_annotated_ids.extend(batch)
 
             logger.info(
@@ -459,7 +484,7 @@ class ExperimentRunner:
 
             self.run_generation(
                 self._fully_annotated_ids,
-                list(self._partial_annotated_ids),  # copy to avoid mutation
+                list(self._partial_annotated_ids),
                 test_ids,
             )
 
@@ -473,8 +498,87 @@ class ExperimentRunner:
 
         return self.results
 
+    def save_checkpoint(self) -> None:
+        """Save experiment state so it can be resumed later.
+
+        Saves: generation count, accumulated study IDs, species weights,
+        and all generation results.
+        """
+        ckpt_path = self.output_dir / "checkpoint.pt"
+        ckpt = {
+            "generation": len(self.results),
+            "fully_annotated_ids": getattr(self, '_fully_annotated_ids', []),
+            "partial_annotated_ids": getattr(self, '_partial_annotated_ids', []),
+            "species_states": {
+                name: species.state_dict()
+                for name, species in self.registry.species.items()
+            },
+            "results": [
+                {
+                    "generation": r.generation,
+                    "num_training_scans": r.num_training_scans,
+                    "mean_dice": r.mean_dice,
+                    "mean_assd": r.mean_assd,
+                    "training_time_s": r.training_time_s,
+                    "inference_time_s": r.inference_time_s,
+                    "scores": [
+                        {"study_id": s.study_id, "dice": s.dice, "assd": s.assd}
+                        for s in r.scores
+                    ],
+                }
+                for r in self.results
+            ],
+        }
+        torch.save(ckpt, ckpt_path)
+        logger.info(f"Checkpoint saved: generation {len(self.results)}")
+
+    def load_checkpoint(self) -> bool:
+        """Load experiment state from checkpoint. Returns True if loaded."""
+        ckpt_path = self.output_dir / "checkpoint.pt"
+        if not ckpt_path.exists():
+            return False
+
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+
+        # Restore species weights
+        from ecoseg.models.species import SpeciesModel
+        for name, state in ckpt["species_states"].items():
+            if name in self.registry.species:
+                self.registry.species[name] = SpeciesModel.from_state_dict(
+                    state, device=self.device
+                )
+
+        # Restore accumulated IDs
+        self._fully_annotated_ids = ckpt["fully_annotated_ids"]
+        self._partial_annotated_ids = ckpt["partial_annotated_ids"]
+
+        # Restore results
+        self.results = []
+        for r_data in ckpt["results"]:
+            scores = [
+                SegmentationScore(
+                    study_id=s["study_id"], dice=s["dice"], assd=s["assd"]
+                )
+                for s in r_data["scores"]
+            ]
+            self.results.append(GenerationResult(
+                generation=r_data["generation"],
+                num_training_scans=r_data["num_training_scans"],
+                scores=scores,
+                mean_dice=r_data["mean_dice"],
+                mean_assd=r_data["mean_assd"],
+                training_time_s=r_data["training_time_s"],
+                inference_time_s=r_data["inference_time_s"],
+            ))
+
+        logger.info(
+            f"Resumed from checkpoint: generation {len(self.results)}, "
+            f"{len(self._partial_annotated_ids)} partial scans accumulated"
+        )
+        return True
+
     def _save_generation(self, result: GenerationResult) -> None:
-        """Save generation results to disk."""
+        """Save generation results and checkpoint to disk."""
         gen_dir = self.output_dir / f"gen_{result.generation:03d}"
         gen_dir.mkdir(exist_ok=True)
 
@@ -485,6 +589,9 @@ class ExperimentRunner:
         ]
         with open(gen_dir / "scores.json", "w") as f:
             json.dump(scores_data, f, indent=2)
+
+        # Save checkpoint after every generation
+        self.save_checkpoint()
 
         # Summary
         with open(gen_dir / "summary.json", "w") as f:

@@ -4,6 +4,7 @@ Extracts patches from labeled volumes and trains each species
 as an independent binary classifier using BCE loss.
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +12,8 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from ecoseg import available_workers
 from ecoseg.models.species import SpeciesModel
@@ -228,13 +231,18 @@ def train_species(
     # If the dataset fits in GPU memory (<4GB), pre-load to GPU and skip
     # DataLoader overhead entirely. 10K patches of 32^3 float32 = ~1.3GB.
     gpu_bytes = all_patches_t.nbytes + all_labels_t.nbytes
-    # Use GPU direct if data fits in half of available GPU memory
+    # Use GPU direct if data fits in currently free GPU memory (with margin)
     if str(device) != "cpu" and torch.cuda.is_available():
-        gpu_total = torch.cuda.get_device_properties(0).total_memory
-        gpu_limit = gpu_total // 2
+        gpu_free = torch.cuda.mem_get_info(0)[0]  # (free, total)
+        gpu_limit = int(gpu_free * 0.7)  # Leave 30% headroom for model + intermediates
     else:
         gpu_limit = 0
     use_gpu_direct = (str(device) != "cpu" and gpu_bytes < gpu_limit)
+    if str(device) != "cpu" and not use_gpu_direct:
+        logger.info(
+            f"Dataset too large for GPU direct ({gpu_bytes / 1e9:.1f}GB data, "
+            f"{gpu_limit / 1e9:.1f}GB available), using batched transfer"
+        )
 
     species.network.to(device)
     species.network.train()
