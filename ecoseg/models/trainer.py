@@ -228,7 +228,13 @@ def train_species(
     # If the dataset fits in GPU memory (<4GB), pre-load to GPU and skip
     # DataLoader overhead entirely. 10K patches of 32^3 float32 = ~1.3GB.
     gpu_bytes = all_patches_t.nbytes + all_labels_t.nbytes
-    use_gpu_direct = (str(device) != "cpu" and gpu_bytes < 4 * 1024**3)
+    # Use GPU direct if data fits in half of available GPU memory
+    if str(device) != "cpu" and torch.cuda.is_available():
+        gpu_total = torch.cuda.get_device_properties(0).total_mem
+        gpu_limit = gpu_total // 2
+    else:
+        gpu_limit = 0
+    use_gpu_direct = (str(device) != "cpu" and gpu_bytes < gpu_limit)
 
     species.network.to(device)
     species.network.train()
