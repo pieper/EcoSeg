@@ -278,8 +278,6 @@ def run_experiment(args):
             # Embedding GrowCut
             t0 = time.time()
             labels_emb, strength_emb = growcut_embedding(emb_crop, seeds_t, gc_config)
-            # Assign any remaining unlabeled voxels by prototype affinity
-            labels_emb = assign_unlabeled(labels_emb, emb_crop, seeds_t)
             time_emb = time.time() - t0
 
             # Diagnostic: log prototype discrimination (first scan, 50 strokes only)
