@@ -398,11 +398,12 @@ class ExperimentRunner:
         fully_ids: list[str],
         partial_ids: list[str],
     ) -> float:
-        """Train species heads on pre-computed embeddings.
+        """Train species heads on embeddings.
 
-        Memory-efficient: extracts feature vectors only at labeled voxel
-        positions from the zarr cache, never loading full embedding volumes.
-        A scan with 1000 labeled voxels uses ~64KB instead of ~1GB.
+        For each training scan, computes embeddings on GPU (or reads from
+        cache), samples feature vectors at labeled voxels directly on GPU,
+        and immediately discards the full embedding volume. Only the small
+        feature vectors (~2000 × 16 floats per scan) accumulate in memory.
         """
         from scipy import ndimage
         from ecoseg.models.head_trainer import HeadTrainingConfig, train_species_head_from_features
@@ -414,7 +415,6 @@ class ExperimentRunner:
             self.ecosegnet.add_species(name)
         self.ecosegnet.to(self.device)
 
-        # Collect feature vectors at labeled positions (not full embeddings)
         ln_features_all = []
         ln_labels_all = []
         bg_features_all = []
@@ -423,15 +423,21 @@ class ExperimentRunner:
         all_ids = list(fully_ids) + list(partial_ids)
         all_types = ["fully_annotated"] * len(fully_ids) + ["partially_annotated"] * len(partial_ids)
 
-        for sid, ann_type in zip(all_ids, all_types):
+        for i, (sid, ann_type) in enumerate(zip(all_ids, all_types)):
             study = self.dataset.load_study(sid)
-            vol = normalize_ct(study.volume)
-
-            # Ensure embeddings are cached (compute if needed)
-            self.emb_cache.ensure_cached(self.ecosegnet, sid, vol, self.device)
-
             if study.seg_mask is None:
                 continue
+
+            vol = normalize_ct(study.volume)
+
+            # Compute embeddings on GPU (or load from cache to GPU)
+            if self.emb_cache.has(sid):
+                emb_np = self.emb_cache.load(sid)
+            else:
+                # Compute on GPU, cache to disk
+                emb_np = self.emb_cache.encode_and_cache(
+                    self.ecosegnet, sid, vol, self.device
+                )
 
             ln_mask = (study.seg_mask > 0).astype(np.uint8)
 
@@ -446,49 +452,59 @@ class ExperimentRunner:
                 dilated = ndimage.binary_dilation(ln_mask.astype(bool), struct)
                 bg_mask = (dilated & ~ln_mask.astype(bool)).astype(np.uint8)
 
-            # Sample voxel coordinates for LN training
-            pos_coords = np.argwhere(ln_mask > 0)
-            neg_coords_ln = np.argwhere(ln_mask == 0)
-            # Hard negatives: sample from similar-intensity tissue
-            if len(pos_coords) > 0:
-                pos_vals = vol[ln_mask > 0]
+            # Sample feature vectors directly from the numpy array (in memory)
+            def _sample_features(mask_pos, mask_neg, emb, vol_norm, n=1000):
+                pos_coords = np.argwhere(mask_pos > 0)
+                if len(pos_coords) == 0:
+                    return None, None
+
+                # Hard negatives from similar-intensity tissue
+                neg_coords = np.argwhere(mask_neg > 0)
+                pos_vals = vol_norm[mask_pos > 0]
                 lo, hi = np.percentile(pos_vals, [10, 90])
-                tissue_neg = np.argwhere((ln_mask == 0) & (vol >= lo) & (vol <= hi))
+                tissue_neg = np.argwhere((mask_neg > 0) & (vol_norm >= lo) & (vol_norm <= hi))
                 if len(tissue_neg) > 100:
-                    neg_coords_ln = tissue_neg
+                    neg_coords = tissue_neg
 
-            n_sample = min(1000, len(pos_coords))
-            if n_sample > 0:
-                idx_pos = self.rng.choice(len(pos_coords), size=n_sample, replace=len(pos_coords) < n_sample)
-                idx_neg = self.rng.choice(len(neg_coords_ln), size=n_sample, replace=len(neg_coords_ln) < n_sample)
+                n_pos = min(n, len(pos_coords))
+                n_neg = min(n, len(neg_coords))
 
-                pos_feats = self.emb_cache.extract_at_coords(sid, pos_coords[idx_pos])
-                neg_feats = self.emb_cache.extract_at_coords(sid, neg_coords_ln[idx_neg])
+                idx_p = self.rng.choice(len(pos_coords), size=n_pos, replace=len(pos_coords) < n_pos)
+                idx_n = self.rng.choice(len(neg_coords), size=n_neg, replace=len(neg_coords) < n_neg)
 
-                if pos_feats is not None and neg_feats is not None:
-                    ln_features_all.append(np.concatenate([pos_feats, neg_feats]))
-                    ln_labels_all.append(np.concatenate([
-                        np.ones(len(pos_feats), dtype=np.float32),
-                        np.zeros(len(neg_feats), dtype=np.float32),
-                    ]))
+                # Vectorized extraction from numpy array
+                pz, py, px = pos_coords[idx_p].T
+                nz, ny, nx = neg_coords[idx_n].T
 
-            # Sample for BG training
-            pos_coords_bg = np.argwhere(bg_mask > 0)
-            neg_coords_bg = np.argwhere(bg_mask == 0)
-            n_sample_bg = min(1000, len(pos_coords_bg))
-            if n_sample_bg > 0:
-                idx_pos_bg = self.rng.choice(len(pos_coords_bg), size=n_sample_bg, replace=len(pos_coords_bg) < n_sample_bg)
-                idx_neg_bg = self.rng.choice(len(neg_coords_bg), size=min(n_sample_bg, len(neg_coords_bg)), replace=len(neg_coords_bg) < n_sample_bg)
+                pos_feats = emb[:, pz, py, px].T.astype(np.float32)
+                neg_feats = emb[:, nz, ny, nx].T.astype(np.float32)
 
-                pos_feats_bg = self.emb_cache.extract_at_coords(sid, pos_coords_bg[idx_pos_bg])
-                neg_feats_bg = self.emb_cache.extract_at_coords(sid, neg_coords_bg[idx_neg_bg])
+                feats = np.concatenate([pos_feats, neg_feats])
+                labels = np.concatenate([
+                    np.ones(len(pos_feats), dtype=np.float32),
+                    np.zeros(len(neg_feats), dtype=np.float32),
+                ])
+                return feats, labels
 
-                if pos_feats_bg is not None and neg_feats_bg is not None:
-                    bg_features_all.append(np.concatenate([pos_feats_bg, neg_feats_bg]))
-                    bg_labels_all.append(np.concatenate([
-                        np.ones(len(pos_feats_bg), dtype=np.float32),
-                        np.zeros(len(neg_feats_bg), dtype=np.float32),
-                    ]))
+            # LN features
+            ln_neg_mask = (ln_mask == 0).astype(np.uint8)
+            feats, labels = _sample_features(ln_mask, ln_neg_mask, emb_np, vol)
+            if feats is not None:
+                ln_features_all.append(feats)
+                ln_labels_all.append(labels)
+
+            # BG features
+            bg_neg_mask = (bg_mask == 0).astype(np.uint8)
+            feats, labels = _sample_features(bg_mask, bg_neg_mask, emb_np, vol)
+            if feats is not None:
+                bg_features_all.append(feats)
+                bg_labels_all.append(labels)
+
+            # Don't keep the full embedding in memory
+            del emb_np
+
+            if (i + 1) % 20 == 0:
+                logger.info(f"  Prepared features from {i + 1}/{len(all_ids)} scans")
 
         logger.info(
             f"Training heads on {len(fully_ids)} full + {len(partial_ids)} partial scans"
